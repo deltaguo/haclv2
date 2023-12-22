@@ -5,9 +5,10 @@
 int isVerify = false;
 
 void hgemv(
+    void *stream,
     int trans,
-    int m,
-    int n,
+    int M,
+    int N,
     const __fp16 *alpha,
     const __fp16 *A,
     int lda,
@@ -15,8 +16,7 @@ void hgemv(
     int incx,
     const __fp16 *beta,
     __fp16 *y,
-    int incy
-);
+    int incy);
 
 int main(int argc, char **argv)
 {
@@ -88,6 +88,22 @@ int main(int argc, char **argv)
         CALL_RT(aclrtMallocHost((void **)(&vectorR), vectorY_FileSize));
         ReadFile("./data/vectorR.bin", vectorY_FileSize, vectorR, vectorY_FileSize);
     }
+
+    __fp16 alpha = 1.0;
+    __fp16 beta = 1.0;
+    printf("Start to run ...\n");
+    hgemv(stream,
+          trans,
+          M,
+          N,
+          &alpha,
+          matrixA_Device,
+          lda,
+          vectorX_Device,
+          incx,
+          &beta,
+          vectorY_Device,
+          incy);
 
     printf("A: \n");
     for (int j = 0; j < lda * N; ++j)

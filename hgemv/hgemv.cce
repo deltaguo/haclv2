@@ -7,11 +7,11 @@
 #ifndef CAMODEL
 
 #include "kernel_operator.h"
-
+#include "stdio.h"
 #endif
 
-using T_INPUT = float;
-using T_OUTPUT = float;
+using T_INPUT = __fp16;
+using T_OUTPUT = __fp16;
 
 constexpr int32_t L0AB_PINGPONG_BUFFER_LEN = 32 * 1024 / sizeof(T_INPUT); // 32KB
 constexpr int32_t L0C_PINGPONG_BUFFER_LEN = 64 * 1024 / sizeof(T_INPUT);  // 64KB
@@ -172,22 +172,20 @@ __aicore__ __inline__ void load_matrix_zZ(__cbuf__ float *dst, __gm__ float *src
 // CAmodel 需要将参数写入到tiling_para_gm中
 #ifdef CAMODEL
 #else
-extern "C" __global__ __aicore__ void dynamic_op_matmul_kernel(
+extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
+    int trans,
+    int M,
+    int N,
+    const half alpha,
     __gm__ T_INPUT *__restrict__ gm_a,
-    __gm__ T_INPUT *__restrict__ gm_b,
-    __gm__ T_OUTPUT *__restrict__ gm_c,
-    int32_t batchSize,
-    int32_t trans_a,
-    int32_t trans_b,
-    int32_t M,
-    int32_t N,
-    int32_t K,
-    int32_t lda,
-    int32_t ldb,
-    int32_t ldc,
+    int lda,
+    __gm__ T_INPUT *__restrict__ gm_x,
+    int incx,
+    const half beta,
+    __gm__ T_OUTPUT *__restrict__ gm_y,
+    int incy,
     int M0,
-    int N0,
-    int K0)
+    int N0)
 #endif
 {
     set_padding(0);
@@ -197,22 +195,46 @@ extern "C" __global__ __aicore__ void dynamic_op_matmul_kernel(
 // CAmodel 从tiling_para_gm解析出参数
 #ifdef CAMODEL
 #endif
+
 }
 
 #ifndef CAMODEL
 void hgemv(
+    void *stream,
     int trans,
-    int m,
-    int n,
-    const half *alpha,
-    const half *A,
+    int M,
+    int N,
+    const __fp16 *alpha,
+    const __fp16 *A,
     int lda,
-    const half *x,
+    const __fp16 *x,
     int incx,
-    const half *beta,
-    half *y,
+    const __fp16 *beta,
+    __fp16 *y,
     int incy)
 {
+    int32_t M_round = (M + 16 - 1) / 16 * 16;
+    int32_t N_round = (N + 16 - 1) / 16 * 16;
+    int32_t M0 = M_round < 128 ? M_round : 128;
+    int32_t N0 = N_round < 128 ? N_round : 128;
 
+    int32_t M0_tile_num_of_M = (M + M0 - 1) / M0;
+    int32_t N0_tile_num_of_N = (N + N0 - 1) / N0;
+    int32_t blockDim = M0_tile_num_of_M * N0_tile_num_of_N;
+    blockDim = blockDim < 20 ? blockDim : 20;
+    dynamic_op_hgemv_kernel<<<blockDim, nullptr, stream>>>(
+        trans,
+        M,
+        N,
+        *alpha,
+        (__gm__ T_INPUT *__restrict__)A,
+        lda,
+        (__gm__ T_INPUT *__restrict__)x,
+        incx,
+        *beta,
+        (__gm__ T_INPUT *__restrict__)y,
+        incy,
+        M0,
+        N0);
 }
 #endif
