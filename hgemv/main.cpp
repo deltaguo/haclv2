@@ -4,6 +4,93 @@
 
 int isVerify = false;
 
+/**
+ * @brief compare actual data and expected data
+ * @param [in] float *actualOutputData: actual data
+ * @param [in] float *expectedOutputData: expected data
+ * @param [in] uint64_t len: data length
+ * @return isCorrect
+ */
+bool compareFp16OutputData(__fp16 *actualOutputData, __fp16 *expectedOutputData, uint64_t len)
+{
+    double error = 0;
+    int64_t errorCount = 0;
+    int64_t lastError = -1;
+    int64_t continuous = 0;
+    int64_t maxContinous = 0;
+    int64_t i = 0;
+    float ratios[] = {0.0001, 0.0001};
+    for (i = 0; i < len; i++)
+    {
+        float actualOutputItem = *(actualOutputData + i);
+        float expectedOutputItem = *(expectedOutputData + i);
+        if (i >= 0 && i < 10)
+        {
+            printf("our: %f, expected: %f\n", actualOutputItem, expectedOutputItem);
+        }
+        float tmp = std::abs((std::min(expectedOutputItem, actualOutputItem)) * ratios[1]);
+        float limitError = tmp;
+        if (std::abs(actualOutputItem - expectedOutputItem) > 0.1 && errorCount < 16)
+        {
+            std::cout << "index: " << i << " sub super 0.1! actual:" << actualOutputItem << ", expected:" << expectedOutputItem << std::endl;
+        }
+        if (std::abs(actualOutputItem - expectedOutputItem) > limitError)
+        {
+            errorCount++;
+            if (i == lastError + 1)
+            {
+                continuous++;
+            }
+            else
+            {
+                if (maxContinous < continuous)
+                {
+                    maxContinous = continuous;
+                }
+                continuous = 1;
+            }
+            lastError = i;
+        }
+        error += std::min((float)1, std::abs((actualOutputItem - expectedOutputItem) / std::min(expectedOutputItem, actualOutputItem)));
+    }
+    error = error / len;
+    std::cout << "error: " << error << std::endl;
+    if (i == len - 1)
+    {
+        if (maxContinous < continuous)
+        {
+            maxContinous = continuous;
+        }
+    }
+
+    int count = 0;
+    if (errorCount >= len * ratios[0] || maxContinous > 16)
+    {
+        for (i = 0; i < len; i++)
+        {
+            float actualOutputItem = *(actualOutputData + i);
+            float expectedOutputItem = *(expectedOutputData + i);
+            float tmp = std::abs(expectedOutputItem * ratios[1]);
+            float limitError = tmp;
+            if (std::abs(actualOutputItem - expectedOutputItem) > limitError && errorCount < 16)
+            {
+                std::cout << "index:" << i << " ,cmprlst:" << std::abs((actualOutputItem - expectedOutputItem) / std::min(expectedOutputItem, actualOutputItem)) << " ,actualDataf:" << actualOutputItem << " ,expectedDataf:" << expectedOutputItem << std::endl;
+            }
+        }
+        printf("cmp len:%lu\n", len);
+        std::cout << "errorCount:" << errorCount << std::endl;
+        printf("ratio:%.10lf\n", (double)errorCount / len);
+        return false;
+    }
+    else
+    {
+        printf("cmp len:%lu\n", len);
+        std::cout << "errorCount:" << errorCount << std::endl;
+        printf("ratio:%.10lf\n", (double)errorCount / len);
+        return true;
+    }
+}
+
 void hgemv(
     void *stream,
     int trans,
@@ -91,6 +178,14 @@ int main(int argc, char **argv)
 
     __fp16 alpha = 1.0;
     __fp16 beta = 1.0;
+    // for (int i = 0; i < lda; ++i)
+    // {
+    //     for (int j = 0; j < N; ++j)
+    //     {
+    //         printf("%.2f ", matrixA_Host[j * lda + i]);
+    //     }
+    //     printf("\n");
+    // }
     printf("Start to run ...\n");
     hgemv(stream,
           trans,
@@ -104,17 +199,24 @@ int main(int argc, char **argv)
           &beta,
           vectorY_Device,
           incy);
-
+    CALL_RT(aclrtSynchronizeStream(stream));
+    CALL_RT(aclrtMemcpy(vectorY_Host, vectorY_FileSize, vectorY_Device, vectorY_FileSize, ACL_MEMCPY_DEVICE_TO_HOST));
+    CALL_RT(aclrtMemcpy(matrixA_Host, matrixA_FileSize, matrixA_Device, matrixA_FileSize, ACL_MEMCPY_DEVICE_TO_HOST));
     printf("A: \n");
-    for (int j = 0; j < lda * N; ++j)
-    {
-        printf("%.2f ", matrixA_Host[j]);
-    }
-    printf("X: \n");
-    for (int j = 0; j < N * incx; ++j)
-    {
-        printf("%.2f ", vectorX_Host[j]);
-    }
+    // for (int i = 0; i < lda; ++i)
+    // {
+    //     for (int j = 0; j < N; ++j)
+    //     {
+    //         printf("%.2f ", matrixA_Host[j * lda + i]);
+    //     }
+    //     printf("\n");
+    // }
+
+    // printf("\nX: \n");
+    // for (int j = 0; j < N * incx; ++j)
+    // {
+    //     printf("%.2f ", vectorX_Host[j]);
+    // }
     std::cout << std::endl;
     printf("Y: \n");
     for (int j = 0; j < M * incy; ++j)
@@ -128,6 +230,10 @@ int main(int argc, char **argv)
         printf("%.2f ", vectorR[j]);
     }
     std::cout << std::endl;
+    if (compareFp16OutputData(vectorY_Host, vectorR, M * incy))
+    {
+        std::cout << "correct!" << std::endl;
+    }
     CALL_RT(aclrtFree(matrixA_Device));
     CALL_RT(aclrtFree(vectorX_Device));
     CALL_RT(aclrtFree(vectorY_Device));

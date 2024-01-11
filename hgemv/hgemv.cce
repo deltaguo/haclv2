@@ -5,175 +5,13 @@
 #endif
 // CAmodel 不需要头文件
 #ifndef CAMODEL
-
-#include "kernel_operator.h"
-#include "stdio.h"
+#include "hgemv_utils.h"
 #endif
-
-using T_INPUT = __fp16;
-using T_OUTPUT = __fp16;
-
-constexpr int32_t L0AB_PINGPONG_BUFFER_LEN = 32 * 1024 / sizeof(T_INPUT); // 32KB
-constexpr int32_t L0C_PINGPONG_BUFFER_LEN = 64 * 1024 / sizeof(T_INPUT);  // 64KB
-constexpr int32_t BLOCK_SIZE = 16;
-constexpr int32_t C0_SIZE = 32 / sizeof(T_INPUT);
-constexpr int32_t CUBE_MATRIX_SIZE = BLOCK_SIZE * C0_SIZE;               // 16 * 8
-constexpr int32_t L1_PINGPONG_BUFFER_LEN = 256 * 1024 / sizeof(T_INPUT); // 256KB
-
-__aicore__ __inline__ void load_matrix_zN(__cbuf__ float *dst, __gm__ float *src,
-                                          int32_t R, int32_t C, int32_t valid_row, int32_t valid_col, size_t stride)
-{
-    constexpr int C0 = 32 / sizeof(float);
-    constexpr int STRIDE_LIMIT = 65536;
-
-    if (stride < STRIDE_LIMIT)
-    {
-        copy_gm_to_cbuf_multi_nd2nz_b32s(
-            dst,
-            src,
-            static_cast<uint8_t>(0),          // sid
-            static_cast<uint16_t>(1),         // ndNum
-            static_cast<uint16_t>(valid_row), // nValue
-            static_cast<uint16_t>(valid_col), // dValue
-            static_cast<uint16_t>(0),         // srcNdMatrixStride
-            static_cast<uint16_t>(stride),    // srcDValue
-            static_cast<uint16_t>(R),         // dstNzC0Stride
-            static_cast<uint16_t>(1),         // dstNzNStride
-            static_cast<uint16_t>(0)          // dstNzMatrixStride
-        );
-    }
-    else
-    {
-        for (int i = 0; i < valid_row; i++)
-        {
-            copy_gm_to_cbuf_multi_nd2nz_b32s(
-                dst + i * C0,
-                src + i * stride,
-                static_cast<uint8_t>(0),          // sid
-                static_cast<uint16_t>(1),         // ndNum
-                static_cast<uint16_t>(1),         // nValue
-                static_cast<uint16_t>(valid_col), // dValue
-                static_cast<uint16_t>(0),         // srcNdMatrixStride, unused
-                static_cast<uint16_t>(0),         // srcDValue, unused
-                static_cast<uint16_t>(R),         // dstNzC0Stride
-                static_cast<uint16_t>(0),         // dstNzNStride, unused
-                static_cast<uint16_t>(0)          // dstNzMatrixStride, unused
-            );
-        }
-    }
-}
-
-__aicore__ __inline__ void load_matrix_zZ(__cbuf__ float *dst, __gm__ float *src,
-                                          int32_t R, int32_t C, int32_t valid_row, int32_t valid_col, size_t stride)
-{
-    constexpr int R0 = 16;
-    constexpr int C0 = 32 / sizeof(float);
-    constexpr int STRIDE_LIMIT = 65536;
-
-    int64_t srcNdStride = R0 * stride;
-    int64_t srcNStride = stride;
-    if (srcNdStride < STRIDE_LIMIT)
-    {
-        int ndNum = valid_row / R0;
-        int remains = valid_row % R0;
-        if (ndNum > 0)
-        {
-            copy_gm_to_cbuf_multi_nd2nz_b32s(
-                dst,
-                src,
-                static_cast<uint8_t>(0),            // sid
-                static_cast<uint16_t>(ndNum),       // ndNum
-                static_cast<uint16_t>(R0),          // nValue
-                static_cast<uint16_t>(valid_col),   // dValue
-                static_cast<uint16_t>(srcNdStride), // srcNdMatrixStride
-                static_cast<uint16_t>(srcNStride),  // srcDValue
-                static_cast<uint16_t>(R0),          // dstNzC0Stride
-                static_cast<uint16_t>(1),           // dstNzNStride
-                static_cast<uint16_t>(R0 * C)       // dstNzMatrixStride
-            );
-        }
-        if (remains > 0)
-        {
-            copy_gm_to_cbuf_multi_nd2nz_b32s(
-                dst + ndNum * R0 * C,
-                src + ndNum * R0 * stride,
-                static_cast<uint8_t>(0),           // sid
-                static_cast<uint16_t>(1),          // ndNum
-                static_cast<uint16_t>(remains),    // nValue
-                static_cast<uint16_t>(valid_col),  // dValue
-                static_cast<uint16_t>(0),          // srcNdMatrixStride
-                static_cast<uint16_t>(srcNStride), // srcDValue
-                static_cast<uint16_t>(R0),         // dstNzC0Stride
-                static_cast<uint16_t>(1),          // dstNzNStride
-                static_cast<uint16_t>(0)           // dstNzMatrixStride
-            );
-        }
-    }
-    else if (srcNStride < STRIDE_LIMIT)
-    {
-        int ndNum = valid_row / R0;
-        int remains = valid_row % R0;
-        for (int i = 0; i < ndNum; i++)
-        {
-            copy_gm_to_cbuf_multi_nd2nz_b32s(
-                dst + i * R0 * C,
-                src + i * R0 * stride,
-                static_cast<uint8_t>(0),           // sid
-                static_cast<uint16_t>(1),          // ndNum
-                static_cast<uint16_t>(R0),         // nValue
-                static_cast<uint16_t>(valid_col),  // dValue
-                static_cast<uint16_t>(0),          // srcNdMatrixStride
-                static_cast<uint16_t>(srcNStride), // srcDValue
-                static_cast<uint16_t>(R0),         // dstNzC0Stride
-                static_cast<uint16_t>(1),          // dstNzNStride
-                static_cast<uint16_t>(0)           // dstNzMatrixStride
-            );
-        }
-        if (remains > 0)
-        {
-            copy_gm_to_cbuf_multi_nd2nz_b32s(
-                dst + ndNum * R0 * C,
-                src + ndNum * R0 * stride,
-                static_cast<uint8_t>(0),           // sid
-                static_cast<uint16_t>(1),          // ndNum
-                static_cast<uint16_t>(remains),    // nValue
-                static_cast<uint16_t>(valid_col),  // dValue
-                static_cast<uint16_t>(0),          // srcNdMatrixStride
-                static_cast<uint16_t>(srcNStride), // srcDValue
-                static_cast<uint16_t>(R0),         // dstNzC0Stride
-                static_cast<uint16_t>(1),          // dstNzNStride
-                static_cast<uint16_t>(0)           // dstNzMatrixStride
-            );
-        }
-    }
-    else
-    {
-        for (int i = 0; i < valid_row; i++)
-        {
-            int idxR0 = i / R0;
-            int idxInR0 = i % R0;
-            copy_gm_to_cbuf_multi_nd2nz_b32s(
-                dst + idxR0 * R0 * C + idxR0 * C0,
-                src + i * stride,
-                static_cast<uint8_t>(0),          // sid
-                static_cast<uint16_t>(1),         // ndNum
-                static_cast<uint16_t>(1),         // nValue
-                static_cast<uint16_t>(valid_col), // dValue
-                static_cast<uint16_t>(0),         // srcNdMatrixStride, unused
-                static_cast<uint16_t>(0),         // srcDValue, unused
-                static_cast<uint16_t>(R0),        // dstNzC0Stride
-                static_cast<uint16_t>(0),         // dstNzNStride, unused
-                static_cast<uint16_t>(0)          // dstNzMatrixStride, unused
-            );
-        }
-    }
-}
 
 // CAmodel 需要将参数写入到tiling_para_gm中
 #ifdef CAMODEL
 #else
 extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
-    int trans,
     int M,
     int N,
     const half alpha,
@@ -195,7 +33,104 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
 // CAmodel 从tiling_para_gm解析出参数
 #ifdef CAMODEL
 #endif
+    // 初始化内存空间
+    auto l1a_buffer_ping = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)0);                              // 128 KB 128*512 half
+    auto l1a_buffer_pong = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)L1_PINGPONG_BUFFER_LEN / 2);     // 128 KB 128*512 half
+    auto l1x_buffer_ping = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)L1_PINGPONG_BUFFER_LEN / 2 * 2); // 128 KB 128*512 half
+    auto l1x_buffer_pong = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)L1_PINGPONG_BUFFER_LEN / 2 * 3); // 128 KB 128*512 half
 
+    auto l0a_buffer_ping = reinterpret_cast<__ca__ T_INPUT *>((uintptr_t)0);                        // 32KB 128*128 half
+    auto l0a_buffer_pong = reinterpret_cast<__ca__ T_INPUT *>((uintptr_t)L0AB_PINGPONG_BUFFER_LEN); // 32KB 128*128 half
+    auto l0b_buffer_ping = reinterpret_cast<__cb__ T_INPUT *>((uintptr_t)0);                        // 32KB 128*128 half
+    auto l0b_buffer_pong = reinterpret_cast<__cb__ T_INPUT *>((uintptr_t)L0AB_PINGPONG_BUFFER_LEN); // 32KB 128*128 half
+
+    auto l0c_buffer_ping = reinterpret_cast<__cc__ float *>((uintptr_t)0);                       // 64KB 128*128 float
+    auto l0c_buffer_pong = reinterpret_cast<__cc__ float *>((uintptr_t)L0C_PINGPONG_BUFFER_LEN); // 64KB 128*128 float
+
+    int m_loop = (M - 1) / M0 + 1;
+    int n_loop = (N - 1) / N0 + 1;
+
+    for (int loop_idx = 0; loop_idx < m_loop; ++loop_idx)
+    {
+        if (loop_idx % get_block_num() != get_block_idx())
+        {
+            continue;
+        }
+        int m_actual = M0;
+        int m_remain = M % M0;
+        if (loop_idx == m_loop - 1 && m_remain)
+        {
+            m_actual = m_remain;
+        }
+        for (int k_idx = 0; k_idx < n_loop; ++k_idx)
+        {
+            int a_offset = loop_idx * M0 + k_idx * N0 * lda; // A的起始偏移
+            int x_offset = k_idx * N0;                       // x的起始偏移
+            int y_offset = loop_idx * M0;                    // y的起始偏移
+
+            int n_actual = N0;
+            int n_remain = N % N0;
+            if (k_idx == n_loop - 1 && n_remain)
+            {
+                n_actual = n_remain;
+            }
+
+            // 搬运A
+            ascblas_matrix_gm2cbuf_ND2nZ(l1a_buffer_ping, gm_a + a_offset, M0, N0, m_actual, n_actual, lda);
+            pipe_barrier(PIPE_ALL);
+            //copy_cbuf_to_gm(gm_a, l1a_buffer_ping, 0, 1, 16 * 272 / 16, 0, 0);
+            // L1A->L0B
+            for (int i = 0; i < N0 / 16; ++i)
+            {
+                ascblas_l12l0b_transpose(l0b_buffer_ping + i * 16 * M0, l1a_buffer_ping + i * 16 * 16, M0 / 16, N0 / 16, 1);
+            }
+            pipe_barrier(PIPE_ALL);
+            // gmB->L1B
+            ascblas_gm2l1(l1x_buffer_ping, gm_x + x_offset, N0 / 16, 1, 1, 16);
+            pipe_barrier(PIPE_ALL);
+            // L1B->L0A
+            ascblas_l12l0a(l0a_buffer_ping, l1x_buffer_ping, N0 / 16, 1, 1);
+            pipe_barrier(PIPE_ALL);
+            // compute
+            if (k_idx == 0)
+            {
+                mad(l0c_buffer_ping, l0a_buffer_ping, l0b_buffer_ping, 16, n_actual, M0, 1);
+            }
+            else
+            {
+                mad(l0c_buffer_ping, l0a_buffer_ping, l0b_buffer_ping, 16, n_actual, M0, 0);
+            }
+            pipe_barrier(PIPE_ALL);
+            ascblas_l0c2gm(gm_y + y_offset, l0c_buffer_ping, M0, 1);
+            pipe_barrier(PIPE_ALL);
+        }
+    }
+}
+
+#ifdef CAMODEL
+#else
+extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
+    int M,
+    int N,
+    const half alpha,
+    __gm__ T_INPUT *__restrict__ gm_a,
+    int lda,
+    __gm__ T_INPUT *__restrict__ gm_x,
+    int incx,
+    const half beta,
+    __gm__ T_OUTPUT *__restrict__ gm_y,
+    int incy,
+    int M0,
+    int N0)
+#endif
+{
+    set_padding(0);
+    set_atomic_none();
+    uint64_t config = 0x1;
+    set_nd_para(config);
+// CAmodel 从tiling_para_gm解析出参数
+#ifdef CAMODEL
+#endif
 }
 
 #ifndef CAMODEL
@@ -213,28 +148,30 @@ void hgemv(
     __fp16 *y,
     int incy)
 {
-    int32_t M_round = (M + 16 - 1) / 16 * 16;
-    int32_t N_round = (N + 16 - 1) / 16 * 16;
-    int32_t M0 = M_round < 128 ? M_round : 128;
-    int32_t N0 = N_round < 128 ? N_round : 128;
+    if (!trans)
+    {
+        int32_t M_round = (M + 16 - 1) / 16 * 16;   // M向上取整为16倍数
+        int32_t N_round = (N + 16 - 1) / 16 * 16;   // N向上取整为16倍数
+        int32_t M0 = M_round < 128 ? M_round : 128; // 基块大小，上限为(128,256)，下限为(M_round, N_round)
+        int32_t N0 = N_round < 256 ? N_round : 256;
 
-    int32_t M0_tile_num_of_M = (M + M0 - 1) / M0;
-    int32_t N0_tile_num_of_N = (N + N0 - 1) / N0;
-    int32_t blockDim = M0_tile_num_of_M * N0_tile_num_of_N;
-    blockDim = blockDim < 20 ? blockDim : 20;
-    dynamic_op_hgemv_kernel<<<blockDim, nullptr, stream>>>(
-        trans,
-        M,
-        N,
-        *alpha,
-        (__gm__ T_INPUT *__restrict__)A,
-        lda,
-        (__gm__ T_INPUT *__restrict__)x,
-        incx,
-        *beta,
-        (__gm__ T_INPUT *__restrict__)y,
-        incy,
-        M0,
-        N0);
+        int32_t M0_tile_num_of_M = (M + M0 - 1) / M0; // M方向块数
+        int32_t N0_tile_num_of_N = (N + N0 - 1) / N0; // N方向块数
+        int32_t blockDim = M0_tile_num_of_M * N0_tile_num_of_N;
+        blockDim = 20; // blockDim < 20 ? blockDim : 20;
+        dynamic_op_hgemv_kernel<<<blockDim, nullptr, stream>>>(
+            M,
+            N,
+            *alpha,
+            (__gm__ T_INPUT *__restrict__)A,
+            lda,
+            (__gm__ T_INPUT *__restrict__)x,
+            incx,
+            *beta,
+            (__gm__ T_INPUT *__restrict__)y,
+            incy,
+            M0,
+            N0);
+    }
 }
 #endif
