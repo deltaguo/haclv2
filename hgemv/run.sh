@@ -24,17 +24,19 @@ mkdir -p data build
 # source /usr/local/Ascend/ascend-toolkit/set_env.sh
 set -e
 CANN_DIR=${ASCEND_HOME_PATH}
-python3 ${OP_NAME}.py --trans $trans -M $M -N $N --lda $lda --incx $incx --incy $incy
+if [[ ${7} != "prof" ]]; then
+    python3 ${OP_NAME}.py --trans $trans -M $M -N $N --lda $lda --incx $incx --incy $incy
+fi
 
 make
 
 if [[ ${7} == "prof" ]]; then
     rm -rf prof/*
     msprof --application="./build/${OP_NAME} $trans $M $N $lda $incx $incy $isVerify" --output=./prof --aic-metric=L2Cache
-    #python3 prof.py `find ./prof -name "op_*.csv"` $batch $M $N $K $lda $ldb $ldc
+    python3 prof.py `find ./prof -name "op_*.csv"` $trans $M $N $lda $incx $incy
 else
     ./build/${OP_NAME} $trans $M $N $lda $incx $incy $isVerify
 fi
 
 # 删除不需要的数据和中间文件
-#rm -rf data/*.bin prof/PROF*
+# rm -rf data/*.bin prof/PROF*

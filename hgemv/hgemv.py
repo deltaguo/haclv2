@@ -23,9 +23,9 @@ def generate_test_data(trans, M, N, lda, incx, incy):
 
     vX.ravel('F').tofile('data/vectorX.bin') 
     vY.ravel('F').tofile('data/vectorY.bin') 
-    print(mA)
-    print(vX)
-    print(vY)
+    # print(mA)
+    # print(vX)
+    # print(vY)
     if trans == 0:
         vX_real = vX[0:N*incx:incx,:]
         vY_real = vY[0:M*incy:incy,:]
@@ -37,7 +37,7 @@ def generate_test_data(trans, M, N, lda, incx, incy):
         vY_real += np.matmul(vX_real, mA_real)
         vY[0:N*incy:incy,:] = vY_real
     vY.ravel('F').tofile('data/vectorR.bin')
-    print(vY)
+    # print(vY)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

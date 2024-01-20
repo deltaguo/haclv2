@@ -1,0 +1,232 @@
+#ifdef __CCE_KT_TEST__
+#define __aicore__
+#else
+#define __aicore__ [aicore]
+#endif
+// CAmodel 不需要头文件
+#ifndef CAMODEL
+#include "hgemv_utils.h"
+#endif
+
+// CAmodel 需要将参数写入到tiling_para_gm中
+#ifdef CAMODEL
+#else
+extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
+    int M,
+    int N,
+    const half alpha,
+    __gm__ T_INPUT *__restrict__ gm_a,
+    int lda,
+    __gm__ T_INPUT *__restrict__ gm_x,
+    int incx,
+    const half beta,
+    __gm__ T_OUTPUT *__restrict__ gm_y,
+    int incy,
+    const int M1,
+    const int N1,
+    const int M0,
+    const int N0)
+#endif
+{
+    set_padding(0);
+    set_atomic_none();
+    uint64_t config = 0x1;
+    set_nd_para(config);
+// CAmodel 从tiling_para_gm解析出参数
+#ifdef CAMODEL
+#endif
+    // 初始化内存空间
+    auto l1a_buffer_ping = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)0);                          // 128 KB 128*512 half
+    auto l1a_buffer_pong = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)L1_PINGPONG_BUFFER_LEN);     // 128 KB 128*512 half
+    auto l1x_buffer_ping = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)L1_PINGPONG_BUFFER_LEN * 2); // 128 KB 16*4096 half
+    auto l1x_buffer_pong = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)L1_PINGPONG_BUFFER_LEN * 3); // 128 KB 16*4096 half
+
+    auto l0a_buffer_ping = reinterpret_cast<__ca__ T_INPUT *>((uintptr_t)0);                        // 32KB 128*128 half
+    auto l0a_buffer_pong = reinterpret_cast<__ca__ T_INPUT *>((uintptr_t)L0AB_PINGPONG_BUFFER_LEN); // 32KB 128*128 half
+    auto l0b_buffer_ping = reinterpret_cast<__cb__ T_INPUT *>((uintptr_t)0);                        // 32KB 128*128 half
+    auto l0b_buffer_pong = reinterpret_cast<__cb__ T_INPUT *>((uintptr_t)L0AB_PINGPONG_BUFFER_LEN); // 32KB 128*128 half
+
+    auto l0c_buffer_ping = reinterpret_cast<__cc__ float *>((uintptr_t)0);                       // 64KB 128*128 float
+    auto l0c_buffer_pong = reinterpret_cast<__cc__ float *>((uintptr_t)L0C_PINGPONG_BUFFER_LEN); // 64KB 128*128 float
+
+    int m_loop = (M - 1) / M1 + 1;
+    int n_loop = (N - 1) / N1 + 1;
+
+    int inner_flag = 1;
+    int outer_flag = 1;
+    int EVENT_ID_GM2L1_BEFORE_L12L0 = 0;
+    int EVENT_ID_L12L0_BEFORE_CUBE = 0;
+    int EVENT_ID_L12L0_BEFORE_GM2L1 = 0;
+    int EVENT_ID_CUBE_BEFORE_L12L0 = 0;
+    int EVENT_ID_CUBE_BEFORE_L02GM = 0;
+    int EVENT_ID_L02GM_BEFORE_CUBE = 0;
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE); // 为了匹配   0
+    for (int loop_idx = 0; loop_idx < m_loop; ++loop_idx)
+    {
+        if (loop_idx % get_block_num() != get_block_idx())
+            continue;
+
+        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);              // 确保在下一次使用cube计算前，将数据写回GM  0
+        auto l0c_buffer = outer_flag & 1 ? l0c_buffer_pong : l0c_buffer_ping; //****************选择L0C BUFFER
+        outer_flag++;
+
+        int m_actual = M1;
+        int m_remain = M % M1;
+        if (loop_idx == m_loop - 1 && m_remain)
+        {
+            m_actual = m_remain;
+        }
+        int x_cp_offset = 0;
+        int y_offset = loop_idx * M1; // y在gm的起始偏移
+
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1); // 为了匹配  0
+        for (int k_idx = 0; k_idx < n_loop; ++k_idx)
+        {
+            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1); // L1->L0之后执行K方向上下一轮的GM->L1   0
+            inner_flag++;
+            auto l1a_buffer = inner_flag & 1 ? l1a_buffer_pong : l1a_buffer_ping; //****************选择L1A BUFFER
+            auto l1x_buffer = inner_flag & 1 ? l1x_buffer_pong : l1x_buffer_ping; //****************选择L1X BUFFER
+
+            int a_offset = loop_idx * M1 + k_idx * N1 * lda; // A在gm的起始偏移
+            int x_offset = k_idx * N1;                       // x在gm的起始偏移
+
+            int n_actual = N1;
+            int n_remain = N % N1;
+            if (k_idx == n_loop - 1 && n_remain)
+            {
+                n_actual = n_remain;
+            }
+            /////////////////////////////////////////////////////////GM->L1
+            ascblas_matrix_gm2cbuf_ND2nZ(l1a_buffer, gm_a + a_offset, M1, N1, m_actual, n_actual, lda); // zZ
+            ascblas_gm2l1(l1x_buffer, gm_x + x_offset, N1 / 16, 1, 1, 16);
+            /////////////////////////////////////////////////////////GM->L1
+
+            set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID_GM2L1_BEFORE_L12L0);  // GM->L1之后执行L1->L0   1
+            wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID_GM2L1_BEFORE_L12L0); // GM->L1之后执行L1->L0   1
+
+            int l1_matrix_num = (M1 / M0) * (N1 / N0);
+            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0); // cube完成之后执行下一轮的L1->L0，为了匹配   1
+            for (int matrix_idx = 0; matrix_idx < l1_matrix_num; ++matrix_idx)
+            {
+                int row_id = 0;
+                int col_id = matrix_idx;
+                int matrix_offset = row_id * M0 * N1 + col_id * 16 * N0;
+
+                auto l0a_buffer = inner_flag & 1 ? l0a_buffer_pong : l0a_buffer_ping; //****************选择L0A BUFFER
+                auto l0b_buffer = inner_flag & 1 ? l0b_buffer_pong : l0b_buffer_ping; //****************选择L0B BUFFER
+                // L1A->L0B
+                wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0); // cube完成之后执行下一轮的L1->L0
+                /////////////////////////////////////////////////////////L1->L0
+                for (int i = 0; i < N0 / 16; ++i)
+                {
+                    ascblas_l12l0b_transpose(l0b_buffer + i * 16 * M0, l1a_buffer + matrix_offset + i * 16 * 16, M0 / 16, N1 / 16, 1);
+                }
+                // L1B->L0A
+                int vector_offset = col_id * 16 * N0;
+                ascblas_l12l0a(l0a_buffer, l1x_buffer + vector_offset, N0 / 16, 1, 1);
+                /////////////////////////////////////////////////////////L1->L0
+
+                set_flag(PIPE_MTE1, PIPE_M, EVENT_ID_L12L0_BEFORE_CUBE);  // L1->L0之后执行CUBE
+                wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID_L12L0_BEFORE_CUBE); // L1->L0之后执行CUBE
+                // compute
+                if (k_idx == 0 && col_id == 0)
+                {
+                    mad(l0c_buffer + row_id * M0 * 16, l0a_buffer, l0b_buffer, 16, N0, M0, 1);
+                }
+                else
+                {
+                    mad(l0c_buffer + row_id * M0 * 16, l0a_buffer, l0b_buffer, 16, N0, M0, 0);
+                }
+                set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0); // cube完成之后执行下一轮的L1->L0
+            }
+            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);    // cube完成之后执行下一轮的L1->L0,为了匹配  1
+            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1); // L1->L0之后执行K方向上下一轮的GM->L1   1
+        }
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1); // 为了匹配
+
+        set_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM);
+        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM);
+        ascblas_l0c2gm(gm_y + y_offset, l0c_buffer, M1, 1);
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE); // 确保在下一次使用cube计算前，将数据写回GM
+    }
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);
+}
+
+#ifdef CAMODEL
+#else
+extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
+    int M,
+    int N,
+    const half alpha,
+    __gm__ T_INPUT *__restrict__ gm_a,
+    int lda,
+    __gm__ T_INPUT *__restrict__ gm_x,
+    int incx,
+    const half beta,
+    __gm__ T_OUTPUT *__restrict__ gm_y,
+    int incy,
+    int M0,
+    int N0)
+#endif
+{
+    set_padding(0);
+    set_atomic_none();
+    uint64_t config = 0x1;
+    set_nd_para(config);
+// CAmodel 从tiling_para_gm解析出参数
+#ifdef CAMODEL
+#endif
+}
+
+#ifndef CAMODEL
+void hgemv(
+    void *stream,
+    int trans,
+    int M,
+    int N,
+    const __fp16 *alpha,
+    const __fp16 *A,
+    int lda,
+    const __fp16 *x,
+    int incx,
+    const __fp16 *beta,
+    __fp16 *y,
+    int incy)
+{
+    // int32_t M1 = 128;
+    // int32_t N1 = 512;
+    // int32_t M0 = 128;
+    // int32_t N0 = 128;
+    int32_t M1 = 1024;
+    int32_t N1 = 64;
+    int32_t M0 = M1;
+    int32_t N0 = 16;
+    if (!trans)
+    {
+        int32_t M_round = (M + 16 - 1) / 16 * 16; // M向上取整为16倍数
+        int32_t N_round = (N + 16 - 1) / 16 * 16; // N向上取整为16倍数
+        M1 = M_round < M1 ? M_round : M1;         // 基块大小，上限为(256,256)，下限为(M_round, N_round)
+        N1 = N_round < N1 ? N_round : N1;
+
+        int32_t M1_tile_num_of_M = (M + M1 - 1) / M1; // M方向块数
+        int32_t N1_tile_num_of_N = (N + N1 - 1) / N1; // N方向块数
+        int32_t blockDim = M1_tile_num_of_M * N1_tile_num_of_N;
+        blockDim = 20; // blockDim < 20 ? blockDim : 20;
+        dynamic_op_hgemv_kernel<<<blockDim, nullptr, stream>>>(
+            M,
+            N,
+            *alpha,
+            (__gm__ T_INPUT *__restrict__)A,
+            lda,
+            (__gm__ T_INPUT *__restrict__)x,
+            incx,
+            *beta,
+            (__gm__ T_INPUT *__restrict__)y,
+            incy,
+            M1,
+            N1,
+            M0,
+            N0);
+    }
+}
+#endif

@@ -1,5 +1,3 @@
-# Usage: bash run_sim.sh <Batch> <M> <K> <N>
-
 # source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 # Modify op_test_frame and simulator path
@@ -8,4 +6,7 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/tools/simulator/A
 
 mkdir -p model
 
-python3 run_sim.py 1 512 512 512 0 1
+python3 run_sim.py 2048 128
+
+export PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages/bin:$PATH
+msopgen sim -c core0 -d ./model -out wave -mix

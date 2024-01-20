@@ -1,18 +1,17 @@
 #ifndef HGEMV_UTILS_H
 #define HGEMV_UTILS_H
 
+#ifndef CAMODEL
 #include "kernel_operator.h"
 #include "stdio.h"
+#endif
 
 using T_INPUT = __fp16;
-using T_OUTPUT = __fp16;
+using T_OUTPUT = float;
 
-constexpr int32_t L0AB_PINGPONG_BUFFER_LEN = 32 * 1024 / sizeof(T_INPUT); // 32KB
-constexpr int32_t L0C_PINGPONG_BUFFER_LEN = 64 * 1024 / sizeof(T_INPUT);  // 64KB
-constexpr int32_t BLOCK_SIZE = 16;
-constexpr int32_t C0_SIZE = 32 / sizeof(T_INPUT);
-constexpr int32_t CUBE_MATRIX_SIZE = BLOCK_SIZE * C0_SIZE;               // 16 * 16
-constexpr int32_t L1_PINGPONG_BUFFER_LEN = 256 * 1024 / sizeof(T_INPUT); // 256KB
+constexpr int32_t L0AB_PINGPONG_BUFFER_LEN = 32 * 1024; // 32KB
+constexpr int32_t L0C_PINGPONG_BUFFER_LEN = 64 * 1024;  // 64KB
+constexpr int32_t L1_PINGPONG_BUFFER_LEN = 128 * 1024;  // 256KB
 
 constexpr int64_t UINT16_STRIDE_LIMIT = 65536;
 
@@ -162,13 +161,13 @@ __aicore__ __inline__ void ascblas_l12l0b_transpose(__cb__ __fp16 *dst,
         inc);
 }
 
-__aicore__ __inline__ void ascblas_l0c2gm(__gm__ __fp16 *dst,
+__aicore__ __inline__ void ascblas_l0c2gm(__gm__ float *dst,
                                           __cc__ float *src,
                                           uint16_t vec_dim,
                                           uint16_t vec_num)
 {
     copy_matrix_cc_to_gm(
-        dst,
+        (__gm__ float*)dst,
         src,
         0,       // sid
         vec_dim, // NSize
@@ -177,8 +176,9 @@ __aicore__ __inline__ void ascblas_l0c2gm(__gm__ __fp16 *dst,
         16,      // srcStride
         0,       // UnitFlagMode
         F322F16, // QuantPRE
+        //NoQuant,
         0,       // ReLUPRE
-        0,       // channelSplit
+        false,       // channelSplit
         true     // NZ2ND_EN
     );
 }

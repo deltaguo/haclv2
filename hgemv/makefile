@@ -9,6 +9,7 @@ $(OP_NAME).o: $(OP_NAME).cce $(OP_NAME)_utils.h
 	-o build/$(OP_NAME).o
 main.o: main.cpp
 	g++ -O2 -c main.cpp -fPIC -I$(CANN_DIR)/include -L$(CANN_DIR)/lib64 -o build/main.o -lascendcl
+	
 $(OP_NAME): $(OP_NAME).cce main.cpp
 	ccec -o build/$(OP_NAME) build/main.o build/$(OP_NAME).o --cce-fatobj-link -L$(CANN_DIR)/lib64 -lascendcl -lruntime -lstdc++
 
@@ -22,3 +23,4 @@ ca:	$(OP_NAME).cce
 
 clean:
 	rm -rf build/*
+	rm -rf data/*

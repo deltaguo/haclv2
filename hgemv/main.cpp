@@ -102,7 +102,7 @@ void hgemv(
     const __fp16 *x,
     int incx,
     const __fp16 *beta,
-    __fp16 *y,
+    float *y,
     int incy);
 
 int main(int argc, char **argv)
@@ -124,12 +124,13 @@ int main(int argc, char **argv)
 
     size_t matrixA_FileSize = lda * N * sizeof(__fp16);
     size_t vectorX_FileSize = N * incx * sizeof(__fp16);
-    size_t vectorY_FileSize = M * incy * sizeof(__fp16);
+    //size_t vectorY_FileSize = M * incy * sizeof(float);
+    size_t vectorY_FileSize = 1024 * M * incy * sizeof(float);
     if (trans)
     {
         matrixA_FileSize = lda * M * sizeof(__fp16);
         vectorX_FileSize = M * incx * sizeof(__fp16);
-        vectorY_FileSize = N * incy * sizeof(__fp16);
+        vectorY_FileSize = N * incy * sizeof(float);
     }
     CALL_RT(aclInit(nullptr));
     int deviceId = 0;
@@ -165,8 +166,12 @@ int main(int argc, char **argv)
     CALL_RT(aclrtMalloc((void **)(&vectorY_Device), vectorY_FileSize, ACL_MEM_MALLOC_HUGE_FIRST));
     if (isVerify)
         ReadFile("./data/vectorY.bin", vectorY_FileSize, vectorY_Host, vectorY_FileSize);
-    if (isVerify)
+    if (isVerify){
+        for(int i = 0;i<M * incy;++i){
+            vectorY_Host[i] = (__fp16)0.0;
+        }
         CALL_RT(aclrtMemcpy(vectorY_Device, vectorY_FileSize, vectorY_Host, vectorY_FileSize, ACL_MEMCPY_HOST_TO_DEVICE));
+    }
 
     // vector R
     __fp16 *vectorR = nullptr;
@@ -197,43 +202,56 @@ int main(int argc, char **argv)
           vectorX_Device,
           incx,
           &beta,
-          vectorY_Device,
+          (float*)vectorY_Device,
           incy);
     CALL_RT(aclrtSynchronizeStream(stream));
-    CALL_RT(aclrtMemcpy(vectorY_Host, vectorY_FileSize, vectorY_Device, vectorY_FileSize, ACL_MEMCPY_DEVICE_TO_HOST));
-    CALL_RT(aclrtMemcpy(matrixA_Host, matrixA_FileSize, matrixA_Device, matrixA_FileSize, ACL_MEMCPY_DEVICE_TO_HOST));
-    printf("A: \n");
-    // for (int i = 0; i < lda; ++i)
-    // {
-    //     for (int j = 0; j < N; ++j)
-    //     {
-    //         printf("%.2f ", matrixA_Host[j * lda + i]);
-    //     }
-    //     printf("\n");
-    // }
+    if (isVerify)
+    {
+        CALL_RT(aclrtMemcpy(vectorY_Host, vectorY_FileSize, vectorY_Device, vectorY_FileSize, ACL_MEMCPY_DEVICE_TO_HOST));
+        CALL_RT(aclrtMemcpy(matrixA_Host, matrixA_FileSize, matrixA_Device, matrixA_FileSize, ACL_MEMCPY_DEVICE_TO_HOST));
+        printf("A: \n");
+        // for (int i = 0; i < lda; ++i)
+        // {
+        //     for (int j = 0; j < N; ++j)
+        //     {
+        //         printf("%.2f ", matrixA_Host[j * lda + i]);
+        //     }
+        //     printf("\n");
+        // }
+        // for (int i = 0; i < 512; ++i)
+        // {
 
-    // printf("\nX: \n");
-    // for (int j = 0; j < N * incx; ++j)
-    // {
-    //     printf("%.2f ", vectorX_Host[j]);
-    // }
-    std::cout << std::endl;
-    printf("Y: \n");
-    for (int j = 0; j < M * incy; ++j)
-    {
-        printf("%.2f ", vectorY_Host[j]);
+        //     printf("%.2f ", matrixA_Host[i]);
+        // }
+
+        // printf("\nX: \n");
+        // for (int j = 0; j < N * incx; ++j)
+        // {
+        //     printf("%.2f ", vectorX_Host[j]);
+        // }
+        // std::cout << std::endl;
+        // printf("Y: \n");
+        // for (int j = 0; j < M * incy + 256; ++j)
+        // {
+        //     printf("%.2f ", ((__fp16*)vectorY_Host)[j]);
+        // }
+        // std::cout << std::endl;
+        // printf("R: \n");
+        // for (int j = 0; j < M * incy; ++j)
+        // {
+        //     printf("%.2f ", vectorR[j]);
+        // }
+        // std::cout << std::endl;
+        __fp16* vectorY_fp16 =  new __fp16[M*incy];
+        for(int i = 0;i<M*incy;++i){
+            vectorY_fp16[i] = ((__fp16*)vectorY_Host)[i];
+        }
+        if (compareFp16OutputData((__fp16*)vectorY_fp16, vectorR, M * incy))
+        {
+            std::cout << "correct!" << std::endl;
+        }
     }
-    std::cout << std::endl;
-    printf("R: \n");
-    for (int j = 0; j < M * incy; ++j)
-    {
-        printf("%.2f ", vectorR[j]);
-    }
-    std::cout << std::endl;
-    if (compareFp16OutputData(vectorY_Host, vectorR, M * incy))
-    {
-        std::cout << "correct!" << std::endl;
-    }
+
     CALL_RT(aclrtFree(matrixA_Device));
     CALL_RT(aclrtFree(vectorX_Device));
     CALL_RT(aclrtFree(vectorY_Device));
