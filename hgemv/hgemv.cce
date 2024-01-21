@@ -64,12 +64,12 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
     int n_loop = (N - 1) / N1 + 1;
     n_loop = (n_loop - 1) / splict_num + 1;
 
-    int n_remain = N % N1;
     int64_t n_splicted = n_loop * N1;
 
     int L0AB_FLAG = 0;
     int L1_FLAG = 0;
     int L0C_FLAG = 0;
+
     auto EVENT_ID_GM2L1_BEFORE_L12L0 = EVENT_ID0;
     auto EVENT_ID_L12L0_BEFORE_CUBE = EVENT_ID0;
     auto EVENT_ID_L12L0_BEFORE_GM2L1 = EVENT_ID0;
@@ -100,7 +100,6 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
         {
             m_actual = m_remain;
         }
-        int x_cp_offset = 0;
         int y_offset = splict_row_id * M1; // y在gm的起始偏移
         {
             for (int k_idx = 0; k_idx < n_loop; ++k_idx)
@@ -130,13 +129,14 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
                 set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID_GM2L1_BEFORE_L12L0 + L1_FLAG);  // GM->L1之后执行L1->L0
                 wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID_GM2L1_BEFORE_L12L0 + L1_FLAG); // GM->L1之后执行L1->L0
                 {
-                    int l1_matrix_row_num = (M1 / M0);
-                    int l1_matrix_col_num = (N1 / N0);
+                    int l1_matrix_row_num = M1 / M0;
+                    int l1_matrix_col_num = N1 / N0;
                     int l1_matrix_num = l1_matrix_row_num * l1_matrix_col_num;
                     set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0，为了匹配
                     set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0，为了匹配
                     for (int matrix_idx = 0; matrix_idx < l1_matrix_num; ++matrix_idx)
                     {
+                        //N方式排列
                         int row_id = matrix_idx % l1_matrix_row_num;
                         int col_id = matrix_idx / l1_matrix_row_num;
                         int matrix_offset = row_id * M0 * N1 + col_id * 16 * N0;
@@ -183,7 +183,6 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
             set_atomic_f16();
             set_atomic_add();
         }
-
         ascblas_l0c2gm(gm_y + y_offset / 2, l0c_buffer, M1, 1);
         if(splict_num > 1){
             set_atomic_none();
@@ -197,8 +196,191 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1);
 }
 
+#ifdef CAMODEL
+extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
+    __gm__ T_INPUT *__restrict__ gm_a,
+    __gm__ T_INPUT *__restrict__ gm_x,
+    __gm__ T_OUTPUT *__restrict__ gm_y,
+    __gm__ uint32_t *__restrict__ tiling_para_gm)
+#else
+extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
+    int64_t M,
+    int64_t N,
+    __gm__ T_INPUT *__restrict__ gm_a,
+    int64_t lda,
+    __gm__ T_INPUT *__restrict__ gm_x,
+    __gm__ T_OUTPUT *__restrict__ gm_y,
+    const int64_t M1,
+    const int64_t N1,
+    const int64_t M0,
+    const int64_t N0,
+    const int64_t splict_num)
+#endif
+{
+    set_padding(0);
+    set_atomic_none();
+    uint64_t config = 0x1;
+    set_nd_para(config);
+// CAmodel 从tiling_para_gm解析出参数
+#ifdef CAMODEL
+    // get tiling args
+    auto tiling_para = reinterpret_cast<__gm__ int32_t *>(tiling_para_gm);
+    int64_t M = tiling_para[0];
+    int64_t N = tiling_para[1];
+    int64_t lda = tiling_para[2];
+    int64_t M1 = tiling_para[3];
+    int64_t N1 = tiling_para[4];
+    int64_t M0 = tiling_para[5];
+    int64_t N0 = tiling_para[6];
+    int64_t splict_num = tiling_para[7];
+#endif
+    auto l1a_buffer_ping = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)0);                          // 128 KB 128*512 half
+    auto l1a_buffer_pong = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)L1_PINGPONG_BUFFER_LEN);     // 128 KB 128*512 half
+    auto l1x_buffer_ping = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)L1_PINGPONG_BUFFER_LEN * 2); // 128 KB 16*4096 half
+    auto l1x_buffer_pong = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)L1_PINGPONG_BUFFER_LEN * 3); // 128 KB 16*4096 half
+
+    auto l0a_buffer_ping = reinterpret_cast<__ca__ T_INPUT *>((uintptr_t)0);                        // 32KB 128*128 half
+    auto l0a_buffer_pong = reinterpret_cast<__ca__ T_INPUT *>((uintptr_t)L0AB_PINGPONG_BUFFER_LEN); // 32KB 128*128 half
+    auto l0b_buffer_ping = reinterpret_cast<__cb__ T_INPUT *>((uintptr_t)0);                        // 32KB 128*128 half
+    auto l0b_buffer_pong = reinterpret_cast<__cb__ T_INPUT *>((uintptr_t)L0AB_PINGPONG_BUFFER_LEN); // 32KB 128*128 half
+
+    auto l0c_buffer_ping = reinterpret_cast<__cc__ T_OUTPUT *>((uintptr_t)0);                       // 64KB 128*128 float
+    auto l0c_buffer_pong = reinterpret_cast<__cc__ T_OUTPUT *>((uintptr_t)L0C_PINGPONG_BUFFER_LEN); // 64KB 128*128 float
+
+    int m_loop = (M - 1) / M1 + 1;
+    int n_loop = (N - 1) / N1 + 1;
+    m_loop = (m_loop - 1) / splict_num + 1; // 区别
+
+    int64_t m_splicted = m_loop * M1; //区别
+
+    int L0AB_FLAG = 0;
+    int L1_FLAG = 0;
+    int L0C_FLAG = 0;
+
+    auto EVENT_ID_GM2L1_BEFORE_L12L0 = EVENT_ID0;
+    auto EVENT_ID_L12L0_BEFORE_CUBE = EVENT_ID0;
+    auto EVENT_ID_L12L0_BEFORE_GM2L1 = EVENT_ID0;
+    auto EVENT_ID_CUBE_BEFORE_L12L0 = EVENT_ID0;
+    auto EVENT_ID_CUBE_BEFORE_L02GM = EVENT_ID0;
+    auto EVENT_ID_L02GM_BEFORE_CUBE = EVENT_ID0;
+
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);     // 为了匹配
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1); // 为了匹配
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1);     // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + 1); // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
+
+    for (int loop_idx = 0; loop_idx < n_loop * splict_num; ++loop_idx){ //区别
+        if (loop_idx % get_block_num() != get_block_idx())
+            continue;
+
+        auto l0c_buffer = L0C_FLAG ? l0c_buffer_pong : l0c_buffer_ping; //****************选择L0C BUFFER
+        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + L0C_FLAG); // 确保在下一次使用cube计算前，将数据写回GM
+
+        int splict_row_id = loop_idx / n_loop;
+        int splict_col_id = loop_idx % n_loop;
+        int splict_a_offset = lda * N1 * splict_col_id + m_splicted * splict_row_id; //以下都是区别
+
+        int n_actual = N1;
+        int n_remain = N % N1;
+        if (splict_col_id == n_loop - 1 && n_remain)
+        {
+            n_actual = n_remain;
+        }
+        int y_offset = splict_col_id * N1; // y在gm的起始偏移, 区别
+        {
+            for (int k_idx = 0; k_idx < m_loop; ++k_idx) //区别
+            {
+                auto l1a_buffer = L1_FLAG ? l1a_buffer_pong : l1a_buffer_ping; //****************选择L1A BUFFER
+                auto l1x_buffer = L1_FLAG ? l1x_buffer_pong : l1x_buffer_ping; //****************选择L1X BUFFER
+
+                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + L1_FLAG); // L1->L0之后执行K方向上下一轮的GM->L1
+
+                int a_offset = splict_a_offset + k_idx * M1; //以下都是区别
+                int x_offset = splict_row_id * m_splicted + k_idx * M1; //区别
+
+                int m_actual = M1;
+                int m_remain = M % M1;
+                if (splict_row_id == (splict_num - 1) && k_idx == (m_loop - 1) && m_remain)
+                {
+                    m_actual = m_remain;
+                }//区别
+                 /////////////////////////////////////////////////////////GM->L1
+                ascblas_matrix_gm2cbuf_ND2nZ(l1a_buffer, gm_a + a_offset, M1, N1, m_actual, n_actual, lda); // zZ
+                ascblas_gm2l1(l1x_buffer, gm_x + x_offset, M1 / 16, 1, 1, 16); //区别
+                /////////////////////////////////////////////////////////GM->L1
+
+                set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID_GM2L1_BEFORE_L12L0 + L1_FLAG);  // GM->L1之后执行L1->L0
+                wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID_GM2L1_BEFORE_L12L0 + L1_FLAG); // GM->L1之后执行L1->L0
+
+                {
+                    int l1_matrix_row_num = (M1 / M0);
+                    int l1_matrix_col_num = (N1 / N0);
+                    int l1_matrix_num = l1_matrix_row_num * l1_matrix_col_num;
+                    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0，为了匹配
+                    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0，为了匹配
+                    for (int matrix_idx = 0; matrix_idx < l1_matrix_num; ++matrix_idx)
+                    {
+                        //Z方式排列
+                        int row_id = matrix_idx / l1_matrix_col_num;
+                        int col_id = matrix_idx % l1_matrix_col_num;
+                        int matrix_offset = row_id * M0 * N1 + col_id * 16 * N0;
+
+                        auto l0a_buffer = L0AB_FLAG ? l0a_buffer_pong : l0a_buffer_ping;      //****************选择L0A BUFFER
+                        auto l0b_buffer = L0AB_FLAG ? l0b_buffer_pong : l0b_buffer_ping;      //****************选择L0B BUFFER
+                        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + L0AB_FLAG); // cube完成之后执行下一轮的L1->L0
+
+                        /////////////////////////////////////////////////////////L1->L0 区别
+                        for (int i = 0; i < N0 / 16; ++i)
+                        {
+                            ascblas_l12l0b(l0b_buffer + i * 16 * 16, l1a_buffer + matrix_offset + i * 16 * 16, M0 / 16, N1 / 16, N0 / 16);
+                        }
+                        int vector_offset = row_id * 16 * M0;
+                        ascblas_l12l0a(l0a_buffer, l1x_buffer + vector_offset, M0 / 16, 1, 1);
+                        /////////////////////////////////////////////////////////L1->L0
+
+                        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID_L12L0_BEFORE_CUBE + L0AB_FLAG);  // L1->L0之后执行CUBE
+                        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID_L12L0_BEFORE_CUBE + L0AB_FLAG); // L1->L0之后执行CUBE
+
+                        // compute 区别
+                        if (k_idx == 0 && row_id == 0)
+                        {
+                            mad(l0c_buffer + col_id * N0 * 16, l0a_buffer, l0b_buffer, 16, M0, N0, 1);
+                        }
+                        else
+                        {
+                            mad(l0c_buffer + col_id * N0 * 16, l0a_buffer, l0b_buffer, 16, M0, N0, 0);
+                        }
+                        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + L0AB_FLAG); // cube完成之后执行下一轮的L1->L0
+                        L0AB_FLAG = 1 - L0AB_FLAG;
+                    }
+                    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0,为了匹配
+                    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0,为了匹配
+                }
+                set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + L1_FLAG); // L1->L0之后执行K方向上下一轮的GM->L1
+                L1_FLAG = 1 - L1_FLAG;
+            }
+        }
+        set_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM + L0C_FLAG);
+        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM + L0C_FLAG);
+        if(splict_num > 1){
+            set_atomic_f16();
+            set_atomic_add();
+        }
+        ascblas_l0c2gm(gm_y + y_offset / 2, l0c_buffer, N1, 1);
+        if(splict_num > 1){
+            set_atomic_none();
+        }
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + L0C_FLAG); // 确保在下一次使用cube计算前，将数据写回GM
+        L0C_FLAG = 1 - L0C_FLAG;
+    }
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1);     // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + 1); // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1);
+}
+
 #ifndef CAMODEL
-void hgemv(
+int hgemv(
     void *stream,
     int trans,
     int M,
@@ -212,25 +394,35 @@ void hgemv(
     float *y,
     int incy)
 {
-    //当内部迭代次数大于1时，M0必须小于M1，且为1/2，1/4等，用于L0双缓冲
-    int32_t M1 = 1024;
-    int32_t N1 = 64;
-    int32_t M0 = 512;
+    //M1和N1必须能够整除M0，N0, 当内部迭代次数大于1时，M0必须小于M1（trans时N0必须小于N1），且为1/2，1/4等，用于L0双缓冲，要不然连续两次双缓冲会互踩
+    int32_t M1 = 32;
+    int32_t N1 = 32;
+    int32_t M0 = 32;
     int32_t N0 = 32;
+
+    int32_t M1_tile_num_of_M = (M + M1 - 1) / M1; // M方向块数
+    int32_t splict_num = 2;
+    int32_t block_num = M1_tile_num_of_M * splict_num;
+    int32_t core_num = 20; // blockDim < 20 ? blockDim : 20;
+    int32_t M_round = (M + 16 - 1) / 16 * 16; // M向上取整为16倍数
+    int32_t N_round = (N + 16 - 1) / 16 * 16; // N向上取整为16倍数
+    M1 = M_round < M1 ? M_round : M1;         // 基块大小，上限为(256,256)，下限为(M_round, N_round)
+    N1 = N_round < N1 ? N_round : N1;
+    M0 = M1 < M0 ? M1 : M0;                   // M0, N0要小于M1, N1
+    N0 = N1 < N0 ? N1 : N0;
+    printf("tiling: M1=%d, N1=%d, M0=%d, N0=%d, splict_num: %d\n", M1, N1, M0, N0, splict_num);
+
+    if(M1 % M0 || N1 % N0){
+        printf("M1 and N1 must be able to divide M0, N0!\n");
+        return 1;
+    }
+
     if (!trans)
     {
-        int32_t M1_tile_num_of_M = (M + M1 - 1) / M1; // M方向块数
-        int32_t splict_num = 4;
-        int32_t block_num = M1_tile_num_of_M * splict_num;
-        int32_t core_num = 20; // blockDim < 20 ? blockDim : 20;
-
-        int32_t M_round = (M + 16 - 1) / 16 * 16; // M向上取整为16倍数
-        int32_t N_round = (N + 16 - 1) / 16 * 16; // N向上取整为16倍数
-        M1 = M_round < M1 ? M_round : M1;         // 基块大小，上限为(256,256)，下限为(M_round, N_round)
-        N1 = N_round < N1 ? N_round : N1;
-        M0 = M1 < M0 ? M1 : M0;                   // M0, N0要小于M1, N1
-        N0 = N1 < N0 ? N1 : N0;
-        printf("tiling: M1=%d, N1=%d, M0=%d, N0=%d, splict_num: %d\n", M1, N1, M0, N0, splict_num);
+        if(M1*N1/(M0*N0) > 1 && M0 == M1){
+            printf("L0 double buffer error!\n");
+            return 1;
+        }
         dynamic_op_hgemv_kernel<<<core_num, nullptr, stream>>>(
             M,
             N,
@@ -243,6 +435,24 @@ void hgemv(
             M0,
             N0,
             splict_num);
+    }else{
+        if(M1*N1/(M0*N0) > 1 && N0 == N1){
+            printf("L0 double buffer error!\n");
+            return 1;
+        }
+        dynamic_op_hgevm_kernel<<<core_num, nullptr, stream>>>(
+            M,
+            N,
+            (__gm__ T_INPUT *__restrict__)A,
+            lda,
+            (__gm__ T_INPUT *__restrict__)x,
+            (__gm__ T_OUTPUT *__restrict__)y,
+            M1,
+            N1,
+            M0,
+            N0,
+            splict_num);
     }
+    return 0;
 }
 #endif
