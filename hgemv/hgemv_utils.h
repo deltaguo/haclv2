@@ -167,7 +167,7 @@ __aicore__ __inline__ void ascblas_l0c2gm(__gm__ float *dst,
                                           uint16_t vec_num)
 {
     copy_matrix_cc_to_gm(
-        (__gm__ float*)dst,
+        (__gm__ __fp16*)dst,
         src,
         0,       // sid
         vec_dim, // NSize

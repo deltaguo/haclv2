@@ -60,10 +60,12 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
     auto l0c_buffer_ping = reinterpret_cast<__cc__ T_OUTPUT *>((uintptr_t)0);                       // 64KB 128*128 float
     auto l0c_buffer_pong = reinterpret_cast<__cc__ T_OUTPUT *>((uintptr_t)L0C_PINGPONG_BUFFER_LEN); // 64KB 128*128 float
 
-    int64_t n_splicted = (N - 1) / splict_num + 1;
-
     int m_loop = (M - 1) / M1 + 1;
-    int n_loop = (n_splicted - 1) / N1 + 1;
+    int n_loop = (N - 1) / N1 + 1;
+    n_loop = (n_loop - 1) / splict_num + 1;
+
+    int n_remain = N % N1;
+    int64_t n_splicted = n_loop * N1;
 
     int L0AB_FLAG = 0;
     int L1_FLAG = 0;
@@ -90,16 +92,16 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
 
         int splict_row_id = loop_idx / splict_num;
         int splict_col_id = loop_idx % splict_num;
-        int splict_a_offset = lda * N1 * splict_col_id + M1 * splict_row_id;
+        int splict_a_offset = lda * n_splicted * splict_col_id + M1 * splict_row_id;
 
         int m_actual = M1;
         int m_remain = M % M1;
-        if (loop_idx == m_loop - 1 && m_remain)
+        if (splict_row_id == m_loop - 1 && m_remain)
         {
             m_actual = m_remain;
         }
         int x_cp_offset = 0;
-        int y_offset = splict_row_id * M1 / 2; // y在gm的起始偏移
+        int y_offset = splict_row_id * M1; // y在gm的起始偏移
         {
             for (int k_idx = 0; k_idx < n_loop; ++k_idx)
             {
@@ -115,7 +117,7 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
 
                 int n_actual = N1;
                 int n_remain = N % N1;
-                if (k_idx == n_loop - 1 && n_remain)
+                if (splict_col_id == (splict_num - 1) && k_idx == (n_loop - 1) && n_remain)
                 {
                     n_actual = n_remain;
                 }
@@ -177,12 +179,12 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
         }
         set_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM + L0C_FLAG);
         wait_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM + L0C_FLAG);
-        //要改成原子加
         if(splict_num > 1){
-            set_atomic_f32();
+            set_atomic_f16();
             set_atomic_add();
         }
-        ascblas_l0c2gm(gm_y + y_offset, l0c_buffer, M1, 1);
+
+        ascblas_l0c2gm(gm_y + y_offset / 2, l0c_buffer, M1, 1);
         if(splict_num > 1){
             set_atomic_none();
         }
@@ -210,33 +212,25 @@ void hgemv(
     float *y,
     int incy)
 {
-    //M0必须小于M1，且为1/2，1/4等，用于L0双缓冲(内部迭代次数>1时)
+    //当内部迭代次数大于1时，M0必须小于M1，且为1/2，1/4等，用于L0双缓冲
     int32_t M1 = 1024;
     int32_t N1 = 64;
-    int32_t M0 = 256;
-    int32_t N0 = 64;
+    int32_t M0 = 512;
+    int32_t N0 = 32;
     if (!trans)
     {
         int32_t M1_tile_num_of_M = (M + M1 - 1) / M1; // M方向块数
-        int32_t splict_num = 1;
+        int32_t splict_num = 4;
         int32_t block_num = M1_tile_num_of_M * splict_num;
         int32_t core_num = 20; // blockDim < 20 ? blockDim : 20;
-        if(core_num < block_num){
-            //L0C双缓冲 M1 < 1024 
-            M1 = M1 < 1024? M1 : 1024;
-            //N1 = 256 * 256 / M1;
-        }else{
-            //L0C单缓冲 M1 < 2048 or 1024
-            M1 = M1 < 2048 ? M1 : 2048;
-            //N1 = 256 * 256 / M1;
-        }
+
         int32_t M_round = (M + 16 - 1) / 16 * 16; // M向上取整为16倍数
         int32_t N_round = (N + 16 - 1) / 16 * 16; // N向上取整为16倍数
         M1 = M_round < M1 ? M_round : M1;         // 基块大小，上限为(256,256)，下限为(M_round, N_round)
         N1 = N_round < N1 ? N_round : N1;
         M0 = M1 < M0 ? M1 : M0;                   // M0, N0要小于M1, N1
         N0 = N1 < N0 ? N1 : N0;
-        printf("tiling: M1=%d, N1=%d, M0=%d, N0=%d\n", M1, N1, M0, N0);
+        printf("tiling: M1=%d, N1=%d, M0=%d, N0=%d, splict_num: %d\n", M1, N1, M0, N0, splict_num);
         dynamic_op_hgemv_kernel<<<core_num, nullptr, stream>>>(
             M,
             N,

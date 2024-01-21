@@ -231,7 +231,7 @@ int main(int argc, char **argv)
         // }
         // std::cout << std::endl;
         // printf("Y: \n");
-        // for (int j = 0; j < M * incy + 256; ++j)
+        // for (int j = 0; j < M * incy; ++j)
         // {
         //     printf("%.2f ", ((__fp16*)vectorY_Host)[j]);
         // }

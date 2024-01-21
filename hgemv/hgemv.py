@@ -7,6 +7,7 @@ def generate_test_data(trans, M, N, lda, incx, incy):
     right = 1
     os.makedirs('data', exist_ok=True)
     mA = np.random.uniform(left,right, size=(lda, N)).astype(np.float16)
+    #mA = np.random.randint(left,right, size=(lda, N)).astype(np.float16)
     #mA = np.arange(0.01,(M*N)*0.01+0.01,0.01).reshape((M,N)).astype(np.float16)
     mA.ravel('F').tofile('data/matrixA.bin')
     mA_real = mA[0:M,0:N]
@@ -14,6 +15,7 @@ def generate_test_data(trans, M, N, lda, incx, incy):
     vY = None
     if trans == 0:
         vX = np.random.uniform(left,right, size=(N * incx, 1)).astype(np.float16)
+        #vX = np.random.randint(left,right, size=(N * incx, 1)).astype(np.float16)
         #vX = np.arange(0.01,N*0.01+0.01,0.01).reshape((N,1)).astype(np.float16)
         #vY = np.random.uniform(left,right, size=(M * incy, 1)).astype(np.float16)
         vY = np.random.uniform(0,0, size=(M * incy, 1)).astype(np.float16)
