@@ -77,6 +77,8 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
     auto EVENT_ID_CUBE_BEFORE_L02GM = EVENT_ID0;
     auto EVENT_ID_L02GM_BEFORE_CUBE = EVENT_ID0;
 
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0，为了匹配
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0，为了匹配
     set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);     // 为了匹配
     set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1); // 为了匹配
     set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1);     // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
@@ -132,8 +134,7 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
                     int l1_matrix_row_num = M1 / M0;
                     int l1_matrix_col_num = N1 / N0;
                     int l1_matrix_num = l1_matrix_row_num * l1_matrix_col_num;
-                    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0，为了匹配
-                    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0，为了匹配
+                
                     for (int matrix_idx = 0; matrix_idx < l1_matrix_num; ++matrix_idx)
                     {
                         //N方式排列
@@ -169,8 +170,6 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
                         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + L0AB_FLAG); // cube完成之后执行下一轮的L1->L0
                         L0AB_FLAG = 1 - L0AB_FLAG;
                     }
-                    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0,为了匹配
-                    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0,为了匹配
                 }
 
                 set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + L1_FLAG); // L1->L0之后执行K方向上下一轮的GM->L1
@@ -190,6 +189,8 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
         set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + L0C_FLAG); // 确保在下一次使用cube计算前，将数据写回GM
         L0C_FLAG = 1 - L0C_FLAG;
     }
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0,为了匹配
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0,为了匹配
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1);     // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + 1); // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);
@@ -268,6 +269,8 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
     set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1); // 为了匹配
     set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1);     // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + 1); // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0，为了匹配
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0，为了匹配
 
     for (int loop_idx = 0; loop_idx < n_loop * splict_num; ++loop_idx){ //区别
         if (loop_idx % get_block_num() != get_block_idx())
@@ -316,8 +319,7 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
                     int l1_matrix_row_num = (M1 / M0);
                     int l1_matrix_col_num = (N1 / N0);
                     int l1_matrix_num = l1_matrix_row_num * l1_matrix_col_num;
-                    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0，为了匹配
-                    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0，为了匹配
+                    
                     for (int matrix_idx = 0; matrix_idx < l1_matrix_num; ++matrix_idx)
                     {
                         //Z方式排列
@@ -373,6 +375,8 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
         set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + L0C_FLAG); // 确保在下一次使用cube计算前，将数据写回GM
         L0C_FLAG = 1 - L0C_FLAG;
     }
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0,为了匹配
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0,为了匹配
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1);     // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + 1); // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);

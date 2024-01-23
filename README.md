@@ -1,5 +1,5 @@
 - 2024.1.21 写完cube上hgemv功能
-  - 性能最高0.76TFlops（910B4峰值带宽0.8T/s，roofline顶约为1.6T/s）
+  - 性能最高0.76TFlops（910B4峰值带宽0.8T/s，roofline顶约为0.8T/s）
   - 存在原子加的精度问题
 - 接下来
   1. tiling方案，优化访存
