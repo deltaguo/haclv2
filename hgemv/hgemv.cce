@@ -62,9 +62,9 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
 
     int m_loop = (M - 1) / M1 + 1;
     int n_loop = (N - 1) / N1 + 1;
-    n_loop = (n_loop - 1) / splict_num + 1;
+    int n_loop_splicted = (n_loop - 1) / splict_num + 1;
 
-    int64_t n_splicted = n_loop * N1;
+    int64_t n_splicted = n_loop_splicted * N1;
 
     int L0AB_FLAG = 0;
     int L1_FLAG = 0;
@@ -104,7 +104,11 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
         }
         int y_offset = splict_row_id * M1; // y在gm的起始偏移
         {
-            for (int k_idx = 0; k_idx < n_loop; ++k_idx)
+            int n_loop_real = n_loop_splicted;
+            if(splict_col_id == splict_num - 1 && n_loop % n_loop_splicted){
+                n_loop_real = n_loop % n_loop_splicted;
+            }
+            for (int k_idx = 0; k_idx < n_loop_real; ++k_idx)
             {
                 auto l1a_buffer = L1_FLAG ? l1a_buffer_pong : l1a_buffer_ping; //****************选择L1A BUFFER
                 auto l1x_buffer = L1_FLAG ? l1x_buffer_pong : l1x_buffer_ping; //****************选择L1X BUFFER
@@ -113,12 +117,13 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
 
                 //int a_offset = loop_idx * M1 + k_idx * N1 * lda; // A在gm的起始偏移
                 int a_offset = splict_a_offset + k_idx * N1 * lda;
+                if(a_offset<0)break;
                 //int x_offset = k_idx * N1;                       // x在gm的起始偏移
                 int x_offset = splict_col_id * n_splicted + k_idx * N1;
 
                 int n_actual = N1;
                 int n_remain = N % N1;
-                if (splict_col_id == (splict_num - 1) && k_idx == (n_loop - 1) && n_remain)
+                if (splict_col_id == (splict_num - 1) && k_idx == (n_loop_real - 1) && n_remain)
                 {
                     n_actual = n_remain;
                 }
@@ -179,10 +184,10 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
         set_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM + L0C_FLAG);
         wait_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM + L0C_FLAG);
         if(splict_num > 1){
-            set_atomic_f16();
+            set_atomic_f32();
             set_atomic_add();
         }
-        ascblas_l0c2gm(gm_y + y_offset / 2, l0c_buffer, M1, 1);
+        ascblas_l0c2gm(gm_y + y_offset, l0c_buffer, M1, 1);
         if(splict_num > 1){
             set_atomic_none();
         }
@@ -250,9 +255,9 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
 
     int m_loop = (M - 1) / M1 + 1;
     int n_loop = (N - 1) / N1 + 1;
-    m_loop = (m_loop - 1) / splict_num + 1; // 区别
+    int m_loop_splicted = (m_loop - 1) / splict_num + 1; // 区别
 
-    int64_t m_splicted = m_loop * M1; //区别
+    int64_t m_splicted = m_loop_splicted * M1; //区别
 
     int L0AB_FLAG = 0;
     int L1_FLAG = 0;
@@ -271,7 +276,6 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
     set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + 1); // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0，为了匹配
     set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0，为了匹配
-
     for (int loop_idx = 0; loop_idx < n_loop * splict_num; ++loop_idx){ //区别
         if (loop_idx % get_block_num() != get_block_idx())
             continue;
@@ -291,7 +295,11 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
         }
         int y_offset = splict_col_id * N1; // y在gm的起始偏移, 区别
         {
-            for (int k_idx = 0; k_idx < m_loop; ++k_idx) //区别
+            int m_loop_real = m_loop_splicted;
+            if(splict_row_id == splict_num - 1 && m_loop % m_loop_splicted){
+                m_loop_real = m_loop % m_loop_splicted;
+            }
+            for (int k_idx = 0; k_idx < m_loop_real; ++k_idx) //区别
             {
                 auto l1a_buffer = L1_FLAG ? l1a_buffer_pong : l1a_buffer_ping; //****************选择L1A BUFFER
                 auto l1x_buffer = L1_FLAG ? l1x_buffer_pong : l1x_buffer_ping; //****************选择L1X BUFFER
@@ -303,7 +311,7 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
 
                 int m_actual = M1;
                 int m_remain = M % M1;
-                if (splict_row_id == (splict_num - 1) && k_idx == (m_loop - 1) && m_remain)
+                if (splict_row_id == (splict_num - 1) && k_idx == (m_loop_real - 1) && m_remain)
                 {
                     m_actual = m_remain;
                 }//区别
@@ -355,8 +363,6 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
                         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + L0AB_FLAG); // cube完成之后执行下一轮的L1->L0
                         L0AB_FLAG = 1 - L0AB_FLAG;
                     }
-                    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0,为了匹配
-                    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0,为了匹配
                 }
                 set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + L1_FLAG); // L1->L0之后执行K方向上下一轮的GM->L1
                 L1_FLAG = 1 - L1_FLAG;
@@ -365,10 +371,10 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
         set_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM + L0C_FLAG);
         wait_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM + L0C_FLAG);
         if(splict_num > 1){
-            set_atomic_f16();
+            set_atomic_f32();
             set_atomic_add();
         }
-        ascblas_l0c2gm(gm_y + y_offset / 2, l0c_buffer, N1, 1);
+        ascblas_l0c2gm(gm_y + y_offset, l0c_buffer, N1, 1);
         if(splict_num > 1){
             set_atomic_none();
         }
@@ -399,13 +405,13 @@ int hgemv(
     int incy)
 {
     //M1和N1必须能够整除M0，N0, 当内部迭代次数大于1时，M0必须小于M1（trans时N0必须小于N1），且为1/2，1/4等，用于L0双缓冲，要不然连续两次双缓冲会互踩
-    int32_t M1 = 32;
-    int32_t N1 = 32;
-    int32_t M0 = 32;
+    int32_t M1 = 1024;
+    int32_t N1 = 64;
+    int32_t M0 = 512;
     int32_t N0 = 32;
 
     int32_t M1_tile_num_of_M = (M + M1 - 1) / M1; // M方向块数
-    int32_t splict_num = 2;
+    int32_t splict_num = 1;
     int32_t block_num = M1_tile_num_of_M * splict_num;
     int32_t core_num = 20; // blockDim < 20 ? blockDim : 20;
     int32_t M_round = (M + 16 - 1) / 16 * 16; // M向上取整为16倍数

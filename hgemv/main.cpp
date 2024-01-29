@@ -172,6 +172,9 @@ int main(int argc, char **argv)
             vectorY_Host[i] = (__fp16)0.0;
         }
         CALL_RT(aclrtMemcpy(vectorY_Device, vectorY_FileSize, vectorY_Host, vectorY_FileSize, ACL_MEMCPY_HOST_TO_DEVICE));
+        for(int i = 0;i<result_len * incy;++i){
+            vectorY_Host[i] = (__fp16)9.0;
+        }
     }
 
     // vector R
@@ -211,7 +214,7 @@ int main(int argc, char **argv)
     }
     if (isVerify)
     {
-        CALL_RT(aclrtMemcpy(vectorY_Host, vectorY_FileSize, vectorY_Device, vectorY_FileSize, ACL_MEMCPY_DEVICE_TO_HOST));
+        CALL_RT(aclrtMemcpy(vectorY_Host, result_len * incy * sizeof(float), vectorY_Device, result_len * incy * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
         CALL_RT(aclrtMemcpy(matrixA_Host, matrixA_FileSize, matrixA_Device, matrixA_FileSize, ACL_MEMCPY_DEVICE_TO_HOST));
         printf("A: \n");
         // for (int i = 0; i < lda; ++i)
@@ -233,27 +236,27 @@ int main(int argc, char **argv)
         //     printf("\n");
         // }
 
-        printf("\nX: \n");
-        for (int j = 0; j < M * incx; ++j)
-        {
-            printf("%.2f ", vectorX_Host[j]);
-        }
-        std::cout << std::endl;
-        printf("Y: \n");
-        for (int j = 0; j < result_len * incy; ++j)
-        {
-            printf("%.2f ", ((__fp16*)vectorY_Host)[j]);
-        }
-        std::cout << std::endl;
-        printf("R: \n");
-        for (int j = 0; j < result_len * incy; ++j)
-        {
-            printf("%.2f ", vectorR[j]);
-        }
-        std::cout << std::endl;
+        // printf("\nX: \n");
+        // for (int j = 0; j < M * incx; ++j)
+        // {
+        //     printf("%.2f ", vectorX_Host[j]);
+        // }
+        // std::cout << std::endl;
+        // printf("Y: \n");
+        // for (int j = 0; j < result_len * incy; ++j)
+        // {
+        //     printf("%.2f ", ((float*)vectorY_Host)[j]);
+        // }
+        // std::cout << std::endl;
+        // printf("R: \n");
+        // for (int j = 0; j < result_len * incy; ++j)
+        // {
+        //     printf("%.2f ", vectorR[j]);
+        // }
+        // std::cout << std::endl;
         __fp16* vectorY_fp16 =  new __fp16[result_len*incy];
         for(int i = 0;i<result_len*incy;++i){
-            vectorY_fp16[i] = ((__fp16*)vectorY_Host)[i];
+            vectorY_fp16[i] = ((float*)vectorY_Host)[i];
         }
         if (compareFp16OutputData((__fp16*)vectorY_fp16, vectorR, result_len * incy))
         {

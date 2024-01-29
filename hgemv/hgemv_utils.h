@@ -167,7 +167,7 @@ __aicore__ __inline__ void ascblas_l0c2gm(__gm__ float *dst,
                                           uint16_t vec_num)
 {
     copy_matrix_cc_to_gm(
-        (__gm__ __fp16*)dst,
+        (__gm__ float*)dst,
         src,
         0,       // sid
         vec_dim, // NSize
@@ -175,8 +175,8 @@ __aicore__ __inline__ void ascblas_l0c2gm(__gm__ float *dst,
         16,      // dstStride_dst_D
         16,      // srcStride
         0,       // UnitFlagMode
-        F322F16, // QuantPRE
-        //NoQuant,
+        //F322F16, // QuantPRE
+        NoQuant,
         0,       // ReLUPRE
         false,       // channelSplit
         true     // NZ2ND_EN
