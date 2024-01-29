@@ -117,7 +117,6 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
 
                 //int a_offset = loop_idx * M1 + k_idx * N1 * lda; // A在gm的起始偏移
                 int a_offset = splict_a_offset + k_idx * N1 * lda;
-                if(a_offset<0)break;
                 //int x_offset = k_idx * N1;                       // x在gm的起始偏移
                 int x_offset = splict_col_id * n_splicted + k_idx * N1;
 
