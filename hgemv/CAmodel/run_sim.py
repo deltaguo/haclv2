@@ -14,7 +14,7 @@ def main():
         print("Invalid arguments, usage: python3 run_sim.py <M> <N> ", file=sys.stderr)
         exit(1)
     
-    M, N = [int(arg) for arg in sys.argv[1:]]
+    trans, M, N = [int(arg) for arg in sys.argv[1:]]
 
     op = AscendOpKernel('../build/hgemv_ca.o', './hgemv.json')
     op.need_do_tiling = True
@@ -33,7 +33,7 @@ def main():
     output_data = op_runner.run(
         op,
         inputs=[matrix_a, matrix_b],
-        tiling=(np.array([M, N, M, 1024, 64, 512, 32, 1]).astype(np.int32)).tobytes()
+        tiling=(np.array([trans, M, N, M, 1024, 64, 512, 32, 1]).astype(np.int32)).tobytes()
     )
 
     output_data.sync_from_device()

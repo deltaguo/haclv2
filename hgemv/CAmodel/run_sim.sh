@@ -6,7 +6,7 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/tools/simulator/A
 
 mkdir -p model
 
-python3 run_sim.py 2048 128
+python3 run_sim.py 0 2048 128
 
 export PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages/bin:$PATH
 msopgen sim -c core0 -d ./model -out wave -mix

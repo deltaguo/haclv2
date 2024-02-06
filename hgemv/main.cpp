@@ -102,7 +102,8 @@ int hgemv(
     const __fp16 *x,
     int incx,
     const __fp16 *beta,
-    float *y,
+    float *workspace,
+    __fp16 *y,
     int incy);
 
 int main(int argc, char **argv)
@@ -162,9 +163,11 @@ int main(int argc, char **argv)
     // vector Y
     __fp16 *vectorY_Host = nullptr;
     __fp16 *vectorY_Device = nullptr;
+    float *workspace = nullptr;
     if (isVerify)
         CALL_RT(aclrtMallocHost((void **)(&vectorY_Host), vectorY_FileSize));
     CALL_RT(aclrtMalloc((void **)(&vectorY_Device), vectorY_FileSize, ACL_MEM_MALLOC_HUGE_FIRST));
+    CALL_RT(aclrtMalloc((void **)(&workspace), result_len * incy * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
     if (isVerify)
         ReadFile("./data/vectorY.bin", vectorY_FileSize, vectorY_Host, vectorY_FileSize);
     if (isVerify){
@@ -206,7 +209,8 @@ int main(int argc, char **argv)
                     vectorX_Device,
                     incx,
                     &beta,
-                    (float*)vectorY_Device,
+                    workspace,
+                    vectorY_Device,
                     incy);
     CALL_RT(aclrtSynchronizeStream(stream));
     if(ret){
@@ -214,7 +218,7 @@ int main(int argc, char **argv)
     }
     if (isVerify)
     {
-        CALL_RT(aclrtMemcpy(vectorY_Host, result_len * incy * sizeof(float), vectorY_Device, result_len * incy * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
+        CALL_RT(aclrtMemcpy(vectorY_Host, result_len * incy * sizeof(float), workspace, result_len * incy * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
         CALL_RT(aclrtMemcpy(matrixA_Host, matrixA_FileSize, matrixA_Device, matrixA_FileSize, ACL_MEMCPY_DEVICE_TO_HOST));
         printf("A: \n");
         // for (int i = 0; i < lda; ++i)

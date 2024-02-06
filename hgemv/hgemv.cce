@@ -7,45 +7,19 @@
 
 #include "hgemv_utils.h"
 
-// CAmodel 需要将参数写入到tiling_para_gm中
-#ifdef CAMODEL
-extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
-    __gm__ T_INPUT *__restrict__ gm_a,
-    __gm__ T_INPUT *__restrict__ gm_x,
-    __gm__ T_OUTPUT *__restrict__ gm_y,
-    __gm__ uint32_t *__restrict__ tiling_para_gm)
-#else
-extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
+__aicore__ __inline__ void dynamic_op_hgemv_kernel(
     int64_t M,
     int64_t N,
-    __gm__ T_INPUT *__restrict__ gm_a,
+    __gm__ __fp16 *__restrict__ gm_a,
     int64_t lda,
-    __gm__ T_INPUT *__restrict__ gm_x,
-    __gm__ T_OUTPUT *__restrict__ gm_y,
+    __gm__ __fp16 *__restrict__ gm_x,
+    __gm__ float *__restrict__ gm_y,
     const int64_t M1,
     const int64_t N1,
     const int64_t M0,
     const int64_t N0,
     const int64_t splict_num)
-#endif
 {
-    set_padding(0);
-    set_atomic_none();
-    uint64_t config = 0x1;
-    set_nd_para(config);
-// CAmodel 从tiling_para_gm解析出参数
-#ifdef CAMODEL
-    // get tiling args
-    auto tiling_para = reinterpret_cast<__gm__ int32_t *>(tiling_para_gm);
-    int64_t M = tiling_para[0];
-    int64_t N = tiling_para[1];
-    int64_t lda = tiling_para[2];
-    int64_t M1 = tiling_para[3];
-    int64_t N1 = tiling_para[4];
-    int64_t M0 = tiling_para[5];
-    int64_t N0 = tiling_para[6];
-    int64_t splict_num = tiling_para[7];
-#endif
     // 初始化内存空间
     auto l1a_buffer_ping = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)0);                          // 128 KB 128*512 half
     auto l1a_buffer_pong = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)L1_PINGPONG_BUFFER_LEN);     // 128 KB 128*512 half
@@ -77,10 +51,10 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
     auto EVENT_ID_CUBE_BEFORE_L02GM = EVENT_ID0;
     auto EVENT_ID_L02GM_BEFORE_CUBE = EVENT_ID0;
 
-    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0，为了匹配
-    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0，为了匹配
-    set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);     // 为了匹配
-    set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1); // 为了匹配
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);         // cube完成之后执行下一轮的L1->L0，为了匹配
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1);     // cube完成之后执行下一轮的L1->L0，为了匹配
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);          // 为了匹配
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1);      // 为了匹配
     set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1);     // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + 1); // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     for (int loop_idx = 0; loop_idx < m_loop * splict_num; ++loop_idx)
@@ -105,7 +79,8 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
         int y_offset = splict_row_id * M1; // y在gm的起始偏移
         {
             int n_loop_real = n_loop_splicted;
-            if(splict_col_id == splict_num - 1 && n_loop % n_loop_splicted){
+            if (splict_col_id == splict_num - 1 && n_loop % n_loop_splicted)
+            {
                 n_loop_real = n_loop % n_loop_splicted;
             }
             for (int k_idx = 0; k_idx < n_loop_real; ++k_idx)
@@ -115,9 +90,9 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
 
                 wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + L1_FLAG); // L1->L0之后执行K方向上下一轮的GM->L1
 
-                //int a_offset = loop_idx * M1 + k_idx * N1 * lda; // A在gm的起始偏移
+                // int a_offset = loop_idx * M1 + k_idx * N1 * lda; // A在gm的起始偏移
                 int a_offset = splict_a_offset + k_idx * N1 * lda;
-                //int x_offset = k_idx * N1;                       // x在gm的起始偏移
+                // int x_offset = k_idx * N1;                       // x在gm的起始偏移
                 int x_offset = splict_col_id * n_splicted + k_idx * N1;
 
                 int n_actual = N1;
@@ -138,10 +113,10 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
                     int l1_matrix_row_num = M1 / M0;
                     int l1_matrix_col_num = N1 / N0;
                     int l1_matrix_num = l1_matrix_row_num * l1_matrix_col_num;
-                
+
                     for (int matrix_idx = 0; matrix_idx < l1_matrix_num; ++matrix_idx)
                     {
-                        //N方式排列
+                        // N方式排列
                         int row_id = matrix_idx % l1_matrix_row_num;
                         int col_id = matrix_idx / l1_matrix_row_num;
                         int matrix_offset = row_id * M0 * N1 + col_id * 16 * N0;
@@ -160,7 +135,7 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
 
                         set_flag(PIPE_MTE1, PIPE_M, EVENT_ID_L12L0_BEFORE_CUBE + L0AB_FLAG);  // L1->L0之后执行CUBE
                         wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID_L12L0_BEFORE_CUBE + L0AB_FLAG); // L1->L0之后执行CUBE
-                        
+
                         // compute
 
                         if (k_idx == 0 && col_id == 0)
@@ -182,63 +157,40 @@ extern "C" __global__ __aicore__ void dynamic_op_hgemv_kernel(
         }
         set_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM + L0C_FLAG);
         wait_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM + L0C_FLAG);
-        if(splict_num > 1){
+        if (splict_num > 1)
+        {
             set_atomic_f32();
             set_atomic_add();
         }
         ascblas_l0c2gm(gm_y + y_offset, l0c_buffer, M1, 1);
-        if(splict_num > 1){
+        if (splict_num > 1)
+        {
             set_atomic_none();
         }
         set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + L0C_FLAG); // 确保在下一次使用cube计算前，将数据写回GM
         L0C_FLAG = 1 - L0C_FLAG;
     }
-    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0,为了匹配
-    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0,为了匹配
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);         // cube完成之后执行下一轮的L1->L0,为了匹配
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1);     // cube完成之后执行下一轮的L1->L0,为了匹配
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1);     // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + 1); // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1);
 }
 
-#ifdef CAMODEL
-extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
-    __gm__ T_INPUT *__restrict__ gm_a,
-    __gm__ T_INPUT *__restrict__ gm_x,
-    __gm__ T_OUTPUT *__restrict__ gm_y,
-    __gm__ uint32_t *__restrict__ tiling_para_gm)
-#else
-extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
+__aicore__ __inline__ void dynamic_op_hgevm_kernel(
     int64_t M,
     int64_t N,
-    __gm__ T_INPUT *__restrict__ gm_a,
+    __gm__ __fp16 *__restrict__ gm_a,
     int64_t lda,
-    __gm__ T_INPUT *__restrict__ gm_x,
-    __gm__ T_OUTPUT *__restrict__ gm_y,
+    __gm__ __fp16 *__restrict__ gm_x,
+    __gm__ float *__restrict__ gm_y,
     const int64_t M1,
     const int64_t N1,
     const int64_t M0,
     const int64_t N0,
     const int64_t splict_num)
-#endif
 {
-    set_padding(0);
-    set_atomic_none();
-    uint64_t config = 0x1;
-    set_nd_para(config);
-// CAmodel 从tiling_para_gm解析出参数
-#ifdef CAMODEL
-    // get tiling args
-    auto tiling_para = reinterpret_cast<__gm__ int32_t *>(tiling_para_gm);
-    int64_t M = tiling_para[0];
-    int64_t N = tiling_para[1];
-    int64_t lda = tiling_para[2];
-    int64_t M1 = tiling_para[3];
-    int64_t N1 = tiling_para[4];
-    int64_t M0 = tiling_para[5];
-    int64_t N0 = tiling_para[6];
-    int64_t splict_num = tiling_para[7];
-#endif
     auto l1a_buffer_ping = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)0);                          // 128 KB 128*512 half
     auto l1a_buffer_pong = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)L1_PINGPONG_BUFFER_LEN);     // 128 KB 128*512 half
     auto l1x_buffer_ping = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)L1_PINGPONG_BUFFER_LEN * 2); // 128 KB 16*4096 half
@@ -256,7 +208,7 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
     int n_loop = (N - 1) / N1 + 1;
     int m_loop_splicted = (m_loop - 1) / splict_num + 1; // 区别
 
-    int64_t m_splicted = m_loop_splicted * M1; //区别
+    int64_t m_splicted = m_loop_splicted * M1; // 区别
 
     int L0AB_FLAG = 0;
     int L1_FLAG = 0;
@@ -269,22 +221,23 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
     auto EVENT_ID_CUBE_BEFORE_L02GM = EVENT_ID0;
     auto EVENT_ID_L02GM_BEFORE_CUBE = EVENT_ID0;
 
-    set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);     // 为了匹配
-    set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1); // 为了匹配
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);          // 为了匹配
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1);      // 为了匹配
     set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1);     // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + 1); // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
-    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0，为了匹配
-    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0，为了匹配
-    for (int loop_idx = 0; loop_idx < n_loop * splict_num; ++loop_idx){ //区别
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);         // cube完成之后执行下一轮的L1->L0，为了匹配
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1);     // cube完成之后执行下一轮的L1->L0，为了匹配
+    for (int loop_idx = 0; loop_idx < n_loop * splict_num; ++loop_idx)
+    { // 区别
         if (loop_idx % get_block_num() != get_block_idx())
             continue;
 
-        auto l0c_buffer = L0C_FLAG ? l0c_buffer_pong : l0c_buffer_ping; //****************选择L0C BUFFER
+        auto l0c_buffer = L0C_FLAG ? l0c_buffer_pong : l0c_buffer_ping;     //****************选择L0C BUFFER
         wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + L0C_FLAG); // 确保在下一次使用cube计算前，将数据写回GM
 
         int splict_row_id = loop_idx / n_loop;
         int splict_col_id = loop_idx % n_loop;
-        int splict_a_offset = lda * N1 * splict_col_id + m_splicted * splict_row_id; //以下都是区别
+        int splict_a_offset = lda * N1 * splict_col_id + m_splicted * splict_row_id; // 以下都是区别
 
         int n_actual = N1;
         int n_remain = N % N1;
@@ -295,28 +248,29 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
         int y_offset = splict_col_id * N1; // y在gm的起始偏移, 区别
         {
             int m_loop_real = m_loop_splicted;
-            if(splict_row_id == splict_num - 1 && m_loop % m_loop_splicted){
+            if (splict_row_id == splict_num - 1 && m_loop % m_loop_splicted)
+            {
                 m_loop_real = m_loop % m_loop_splicted;
             }
-            for (int k_idx = 0; k_idx < m_loop_real; ++k_idx) //区别
+            for (int k_idx = 0; k_idx < m_loop_real; ++k_idx) // 区别
             {
                 auto l1a_buffer = L1_FLAG ? l1a_buffer_pong : l1a_buffer_ping; //****************选择L1A BUFFER
                 auto l1x_buffer = L1_FLAG ? l1x_buffer_pong : l1x_buffer_ping; //****************选择L1X BUFFER
 
                 wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + L1_FLAG); // L1->L0之后执行K方向上下一轮的GM->L1
 
-                int a_offset = splict_a_offset + k_idx * M1; //以下都是区别
-                int x_offset = splict_row_id * m_splicted + k_idx * M1; //区别
+                int a_offset = splict_a_offset + k_idx * M1;            // 以下都是区别
+                int x_offset = splict_row_id * m_splicted + k_idx * M1; // 区别
 
                 int m_actual = M1;
                 int m_remain = M % M1;
                 if (splict_row_id == (splict_num - 1) && k_idx == (m_loop_real - 1) && m_remain)
                 {
                     m_actual = m_remain;
-                }//区别
-                 /////////////////////////////////////////////////////////GM->L1
+                }                                                                                           // 区别
+                                                                                                            /////////////////////////////////////////////////////////GM->L1
                 ascblas_matrix_gm2cbuf_ND2nZ(l1a_buffer, gm_a + a_offset, M1, N1, m_actual, n_actual, lda); // zZ
-                ascblas_gm2l1(l1x_buffer, gm_x + x_offset, M1 / 16, 1, 1, 16); //区别
+                ascblas_gm2l1(l1x_buffer, gm_x + x_offset, M1 / 16, 1, 1, 16);                              // 区别
                 /////////////////////////////////////////////////////////GM->L1
 
                 set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID_GM2L1_BEFORE_L12L0 + L1_FLAG);  // GM->L1之后执行L1->L0
@@ -326,10 +280,10 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
                     int l1_matrix_row_num = (M1 / M0);
                     int l1_matrix_col_num = (N1 / N0);
                     int l1_matrix_num = l1_matrix_row_num * l1_matrix_col_num;
-                    
+
                     for (int matrix_idx = 0; matrix_idx < l1_matrix_num; ++matrix_idx)
                     {
-                        //Z方式排列
+                        // Z方式排列
                         int row_id = matrix_idx / l1_matrix_col_num;
                         int col_id = matrix_idx % l1_matrix_col_num;
                         int matrix_offset = row_id * M0 * N1 + col_id * 16 * N0;
@@ -369,23 +323,93 @@ extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
         }
         set_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM + L0C_FLAG);
         wait_flag(PIPE_M, PIPE_FIX, EVENT_ID_CUBE_BEFORE_L02GM + L0C_FLAG);
-        if(splict_num > 1){
+        if (splict_num > 1)
+        {
             set_atomic_f32();
             set_atomic_add();
         }
         ascblas_l0c2gm(gm_y + y_offset, l0c_buffer, N1, 1);
-        if(splict_num > 1){
+        if (splict_num > 1)
+        {
             set_atomic_none();
         }
         set_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + L0C_FLAG); // 确保在下一次使用cube计算前，将数据写回GM
         L0C_FLAG = 1 - L0C_FLAG;
     }
-    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);     // cube完成之后执行下一轮的L1->L0,为了匹配
-    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1); // cube完成之后执行下一轮的L1->L0,为了匹配
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0);         // cube完成之后执行下一轮的L1->L0,为了匹配
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID_CUBE_BEFORE_L12L0 + 1);     // cube完成之后执行下一轮的L1->L0,为了匹配
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1);     // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID_L12L0_BEFORE_GM2L1 + 1); // L1数据传输到L0之后，再进行下一轮GM到L1的数据搬运，为了匹配
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1);
+}
+
+__aicore__ __inline__ void vfmadd_float2half(
+    __gm__ float *__restrict__ workspace,
+    __gm__ __fp16 *__restrict__ gm_y,
+    __fp16 alpha,
+    __fp16 beta,
+    int64_t incy)
+{
+}
+
+#ifdef CAMODEL
+extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
+    __gm__ T_INPUT *__restrict__ gm_a,
+    __gm__ T_INPUT *__restrict__ gm_x,
+    __gm__ T_OUTPUT *__restrict__ gm_y,
+    __gm__ uint32_t *__restrict__ tiling_para_gm)
+#else
+extern "C" __global__ __aicore__ void ascblasHgemv_kernel(
+    int64_t trans,
+    int64_t M,
+    int64_t N,
+    __gm__ T_INPUT *__restrict__ gm_a,
+    int64_t lda,
+    __gm__ T_INPUT *__restrict__ gm_x,
+    __gm__ float *__restrict__ workspace,
+    __gm__ __fp16 *__restrict__ gm_y,
+    const int64_t M1,
+    const int64_t N1,
+    const int64_t M0,
+    const int64_t N0,
+    const int64_t splict_num,
+    __fp16 alpha,
+    __fp16 beta,
+    int64_t incy)
+#endif
+{
+#if defined(__DAV_C220_CUBE__)
+    set_padding(0);
+    set_atomic_none();
+    uint64_t config = 0x1;
+    set_nd_para(config);
+// CAmodel 从tiling_para_gm解析出参数
+#ifdef CAMODEL
+    // get tiling args
+    auto tiling_para = reinterpret_cast<__gm__ int32_t *>(tiling_para_gm);
+    int64_t trans = tiling_para[0];
+    int64_t M = tiling_para[1];
+    int64_t N = tiling_para[2];
+    int64_t lda = tiling_para[3];
+    int64_t M1 = tiling_para[4];
+    int64_t N1 = tiling_para[5];
+    int64_t M0 = tiling_para[6];
+    int64_t N0 = tiling_para[7];
+    int64_t splict_num = tiling_para[8];
+#endif
+    if (trans)
+    {
+        dynamic_op_hgevm_kernel(M, N, gm_a, lda, gm_x, workspace, M1, N1, M0, N0, splict_num);
+    }
+    else
+    {
+        dynamic_op_hgemv_kernel(M, N, gm_a, lda, gm_x, workspace, M1, N1, M0, N0, splict_num);
+    }
+#elif defined(__DAV_C220_VEC__)
+    vfmadd_float2half(workspace, gm_y, alpha, beta, incy);
+    pipe_barrier(PIPE_ALL);
+#endif
 }
 
 #ifndef CAMODEL
@@ -400,10 +424,11 @@ int hgemv(
     const __fp16 *x,
     int incx,
     const __fp16 *beta,
-    float *y,
+    float *workspace,
+    __fp16 *y,
     int incy)
 {
-    //M1和N1必须能够整除M0，N0, 当内部迭代次数大于1时，M0必须小于M1（trans时N0必须小于N1），且为1/2，1/4等，用于L0双缓冲，要不然连续两次双缓冲会互踩
+    // M1和N1必须能够整除M0，N0, 当内部迭代次数大于1时，M0必须小于M1（trans时N0必须小于N1），且为1/2，1/4等，用于L0双缓冲，要不然连续两次双缓冲会互踩
     int32_t M1 = 1024;
     int32_t N1 = 64;
     int32_t M0 = 512;
@@ -412,56 +437,54 @@ int hgemv(
     int32_t M1_tile_num_of_M = (M + M1 - 1) / M1; // M方向块数
     int32_t splict_num = 1;
     int32_t block_num = M1_tile_num_of_M * splict_num;
-    int32_t core_num = 20; // blockDim < 20 ? blockDim : 20;
+    int32_t core_num = 20;                    // blockDim < 20 ? blockDim : 20;
     int32_t M_round = (M + 16 - 1) / 16 * 16; // M向上取整为16倍数
     int32_t N_round = (N + 16 - 1) / 16 * 16; // N向上取整为16倍数
     M1 = M_round < M1 ? M_round : M1;         // 基块大小，上限为(256,256)，下限为(M_round, N_round)
     N1 = N_round < N1 ? N_round : N1;
-    M0 = M1 < M0 ? M1 : M0;                   // M0, N0要小于M1, N1
+    M0 = M1 < M0 ? M1 : M0; // M0, N0要小于M1, N1
     N0 = N1 < N0 ? N1 : N0;
     printf("tiling: M1=%d, N1=%d, M0=%d, N0=%d, splict_num: %d\n", M1, N1, M0, N0, splict_num);
 
-    if(M1 % M0 || N1 % N0){
+    if (M1 % M0 || N1 % N0)
+    {
         printf("M1 and N1 must be able to divide M0, N0!\n");
         return 1;
     }
 
     if (!trans)
     {
-        if(M1*N1/(M0*N0) > 1 && M0 == M1){
+        if (M1 * N1 / (M0 * N0) > 1 && M0 == M1)
+        {
             printf("L0 double buffer error!\n");
             return 1;
         }
-        dynamic_op_hgemv_kernel<<<core_num, nullptr, stream>>>(
-            M,
-            N,
-            (__gm__ T_INPUT *__restrict__)A,
-            lda,
-            (__gm__ T_INPUT *__restrict__)x,
-            (__gm__ T_OUTPUT *__restrict__)y,
-            M1,
-            N1,
-            M0,
-            N0,
-            splict_num);
-    }else{
-        if(M1*N1/(M0*N0) > 1 && N0 == N1){
-            printf("L0 double buffer error!\n");
-            return 1;
-        }
-        dynamic_op_hgevm_kernel<<<core_num, nullptr, stream>>>(
-            M,
-            N,
-            (__gm__ T_INPUT *__restrict__)A,
-            lda,
-            (__gm__ T_INPUT *__restrict__)x,
-            (__gm__ T_OUTPUT *__restrict__)y,
-            M1,
-            N1,
-            M0,
-            N0,
-            splict_num);
     }
+    else
+    {
+        if (M1 * N1 / (M0 * N0) > 1 && N0 == N1)
+        {
+            printf("L0 double buffer error!\n");
+            return 1;
+        }
+    }
+    ascblasHgemv_kernel<<<core_num, nullptr, stream>>>(
+        trans,
+        M,
+        N,
+        (__gm__ T_INPUT *__restrict__)A,
+        lda,
+        (__gm__ T_INPUT *__restrict__)x,
+        (__gm__ T_OUTPUT *__restrict__)workspace,
+        (__gm__ __fp16 *__restrict__)y,
+        M1,
+        N1,
+        M0,
+        N0,
+        splict_num,
+        *alpha,
+        *beta,
+        incy);
     return 0;
 }
 #endif
