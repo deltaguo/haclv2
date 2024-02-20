@@ -1,6 +1,7 @@
 #include "data_utils.h"
 
 #include <acl/acl.h>
+#include "rt.h"
 
 int isVerify = false;
 
@@ -104,11 +105,12 @@ int hgemv(
     const __fp16 *beta,
     float *workspace,
     __fp16 *y,
-    int incy);
+    int incy,
+    void* ffts_addr);
 
 int main(int argc, char **argv)
 {
-    if (argc != 7 && argc != 8)
+    if (argc != 9 && argc != 10)
     {
         std::cerr << "Usage: <exe> trans M N lda incx incy [isVerify]" << std::endl;
         return 0;
@@ -117,11 +119,13 @@ int main(int argc, char **argv)
     int32_t M = std::stoi(argv[2]);
     int32_t N = std::stoi(argv[3]);
     int32_t lda = std::stoi(argv[4]);
-    int32_t incx = std::stoi(argv[5]);
-    int32_t incy = std::stoi(argv[6]);
+    __fp16 alpha = (__fp16)std::atof(argv[5]);
+    __fp16 beta = (__fp16)std::atof(argv[6]);
+    int32_t incx = std::stoi(argv[7]);
+    int32_t incy = std::stoi(argv[8]);
 
-    if (argc > 7)
-        isVerify = std::stoi(argv[7]);
+    if (argc > 9)
+        isVerify = std::stoi(argv[9]);
 
     size_t result_len = trans ? N : M; 
 
@@ -171,13 +175,7 @@ int main(int argc, char **argv)
     if (isVerify)
         ReadFile("./data/vectorY.bin", vectorY_FileSize, vectorY_Host, vectorY_FileSize);
     if (isVerify){
-        for(int i = 0;i<result_len * incy;++i){
-            vectorY_Host[i] = (__fp16)0.0;
-        }
         CALL_RT(aclrtMemcpy(vectorY_Device, vectorY_FileSize, vectorY_Host, vectorY_FileSize, ACL_MEMCPY_HOST_TO_DEVICE));
-        for(int i = 0;i<result_len * incy;++i){
-            vectorY_Host[i] = (__fp16)9.0;
-        }
     }
 
     // vector R
@@ -188,8 +186,10 @@ int main(int argc, char **argv)
         ReadFile("./data/vectorR.bin", vectorY_FileSize, vectorR, vectorY_FileSize);
     }
 
-    __fp16 alpha = 1.0;
-    __fp16 beta = 1.0;
+    void* ffts_addr;
+    uint32_t ffts_len;
+
+    CALL_RT(rtGetC2cCtrlAddr((uint64_t*)&ffts_addr, &ffts_len));
     // for (int i = 0; i < lda; ++i)
     // {
     //     for (int j = 0; j < N; ++j)
@@ -211,16 +211,21 @@ int main(int argc, char **argv)
                     &beta,
                     workspace,
                     vectorY_Device,
-                    incy);
+                    incy,
+                    ffts_addr);
     CALL_RT(aclrtSynchronizeStream(stream));
     if(ret){
         exit(1);
     }
     if (isVerify)
     {
-        CALL_RT(aclrtMemcpy(vectorY_Host, result_len * incy * sizeof(float), workspace, result_len * incy * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
-        CALL_RT(aclrtMemcpy(matrixA_Host, matrixA_FileSize, matrixA_Device, matrixA_FileSize, ACL_MEMCPY_DEVICE_TO_HOST));
-        printf("A: \n");
+        CALL_RT(aclrtMemcpy(vectorY_Host, result_len * incy * sizeof(__fp16), vectorY_Device, result_len * incy * sizeof(__fp16), ACL_MEMCPY_DEVICE_TO_HOST));
+        // CALL_RT(aclrtMemcpy(matrixA_Host, result_len * incy * sizeof(float), workspace, result_len * incy * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
+        // printf("A: \n");
+        // for(int i = 0;i<512;++i){
+        //     printf("%f ", ((float*)matrixA_Host)[i]);
+        // }
+        // printf("\n");
         // for (int i = 0; i < lda; ++i)
         // {
         //     for (int j = 0; j < N; ++j)
@@ -258,11 +263,11 @@ int main(int argc, char **argv)
         //     printf("%.2f ", vectorR[j]);
         // }
         // std::cout << std::endl;
-        __fp16* vectorY_fp16 =  new __fp16[result_len*incy];
-        for(int i = 0;i<result_len*incy;++i){
-            vectorY_fp16[i] = ((float*)vectorY_Host)[i];
-        }
-        if (compareFp16OutputData((__fp16*)vectorY_fp16, vectorR, result_len * incy))
+        // __fp16* vectorY_fp16 =  new __fp16[result_len*incy];
+        // for(int i = 0;i<result_len*incy;++i){
+        //     vectorY_fp16[i] = ((float*)vectorY_Host)[i];
+        // }
+        if (compareFp16OutputData(vectorY_Host, vectorR, result_len * incy))
         {
             std::cout << "correct!" << std::endl;
         }

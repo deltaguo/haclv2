@@ -2,10 +2,11 @@
   - 性能最高0.76TFlops（910B4峰值带宽0.8T/s，roofline顶约为0.8T/s）
   - 存在原子加的精度问题
 - 2024.1.29 完成splict方案，以float将结果保存在gm上
+- 2024.2.20 完成带有alpha beta的mix算子
 - 接下来
   1. tiling方案，优化访存
-  2. 使用vector单元进行前处理后处理
-  4. 核间同步
+  2. Incx，incy
+  3. 用vector来算？
 
 昇腾910B上的一些要点:
 

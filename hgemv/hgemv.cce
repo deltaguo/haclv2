@@ -7,6 +7,9 @@
 
 #include "hgemv_utils.h"
 
+#define STANDRAD
+
+#if defined(__DAV_C220_CUBE__)
 __aicore__ __inline__ void dynamic_op_hgemv_kernel(
     int64_t M,
     int64_t N,
@@ -343,24 +346,74 @@ __aicore__ __inline__ void dynamic_op_hgevm_kernel(
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1);
 }
+#endif
 
+#if defined(__DAV_C220_VEC__)
 __aicore__ __inline__ void vfmadd_float2half(
+    int64_t length,
     __gm__ float *__restrict__ workspace,
     __gm__ __fp16 *__restrict__ gm_y,
     __fp16 alpha,
     __fp16 beta,
     int64_t incy)
 {
+    int vec_id = get_block_idx() * get_subblockdim() + get_subblockid();
+
+    int64_t sub_len = 256;
+    auto x_fp32 = reinterpret_cast<__ubuf__ float *>((uintptr_t)(0));
+    auto y_fp32 = reinterpret_cast<__ubuf__ float *>((uintptr_t)(sub_len * 4));
+    auto x_fp16 = reinterpret_cast<__ubuf__ half *>((uintptr_t)(sub_len * 8));
+    auto y_fp16 = reinterpret_cast<__ubuf__ half *>((uintptr_t)(sub_len * 10));
+
+    int loop = (length - 1) / sub_len + 1;
+    int remain = length % sub_len;
+
+    int real_sub_len = sub_len;
+    //copy_gm_to_ubuf(y_fp16, gm_y, 0, 1, 1, 0, 0); //y->ub
+    for(int loop_idx = 0; loop_idx < loop; ++loop_idx){
+        if(loop_idx % (get_block_num()*get_subblockdim()) != vec_id)
+            continue;
+
+        if(remain && loop_idx == loop - 1){
+            real_sub_len = remain;
+        }
+        int offset = loop_idx * sub_len;
+        copy_gm_to_ubuf(y_fp16, gm_y + offset, 0, 1, (real_sub_len-1) / 16 + 1, 0, 0); //y->ub
+        set_flag(PIPE_MTE2, PIPE_V, 0);
+
+        copy_gm_to_ubuf(x_fp32, workspace + offset, 0, 1, sub_len / 8, 0, 0); //x->ub
+        set_flag(PIPE_MTE2, PIPE_V, 1);
+
+        wait_flag(PIPE_MTE2, PIPE_V, 0);
+        CastImpl(y_fp32, y_fp16, AscendC::RoundMode::CAST_NONE, sub_len); //y fp16->fp32
+        pipe_barrier(PIPE_V);
+        vmuls(y_fp32, y_fp32, (float)beta, sub_len / 64, 1, 1, 8, 8); // y=*beta
+        wait_flag(PIPE_MTE2, PIPE_V, 1);
+        pipe_barrier(PIPE_V);
+        vaxpy(y_fp32, x_fp32, (float)alpha, sub_len / 64, 1, 1, 8, 8); //y = x*alpha
+        pipe_barrier(PIPE_V);
+        CastImpl(y_fp16, y_fp32, AscendC::RoundMode::CAST_NONE, sub_len); //y fp32->fp16
+        set_flag(PIPE_V, PIPE_MTE3, 0);
+        wait_flag(PIPE_V, PIPE_MTE3, 0);
+        copy_ubuf_to_gm(gm_y + offset, y_fp16, 0, 1, real_sub_len / 16, 0, 0); // ub->y
+        set_flag(PIPE_MTE3, PIPE_S, 0);
+        wait_flag(PIPE_MTE3, PIPE_S, 0);
+        int sub_remain = real_sub_len % 16;
+        for(int i = 0; i < sub_remain; ++i){
+            *(gm_y + offset + real_sub_len / 16 * 16 + i) = *(y_fp16 + real_sub_len / 16 * 16 + i);
+        }
+    }
 }
+#endif
 
 #ifdef CAMODEL
-extern "C" __global__ __aicore__ void dynamic_op_hgevm_kernel(
+__global__ __aicore__ void dynamic_op_hgevm_kernel(
     __gm__ T_INPUT *__restrict__ gm_a,
     __gm__ T_INPUT *__restrict__ gm_x,
     __gm__ T_OUTPUT *__restrict__ gm_y,
     __gm__ uint32_t *__restrict__ tiling_para_gm)
 #else
-extern "C" __global__ __aicore__ void ascblasHgemv_kernel(
+__global__ __aicore__ void ascblasHgemv_kernel(
     int64_t trans,
     int64_t M,
     int64_t N,
@@ -376,7 +429,8 @@ extern "C" __global__ __aicore__ void ascblasHgemv_kernel(
     const int64_t splict_num,
     __fp16 alpha,
     __fp16 beta,
-    int64_t incy)
+    int64_t incy,
+    __gm__ void* ffts_addr)
 #endif
 {
 #if defined(__DAV_C220_CUBE__)
@@ -384,6 +438,7 @@ extern "C" __global__ __aicore__ void ascblasHgemv_kernel(
     set_atomic_none();
     uint64_t config = 0x1;
     set_nd_para(config);
+    set_ffts_base_addr((uint64_t)ffts_addr);
 // CAmodel 从tiling_para_gm解析出参数
 #ifdef CAMODEL
     // get tiling args
@@ -406,9 +461,35 @@ extern "C" __global__ __aicore__ void ascblasHgemv_kernel(
     {
         dynamic_op_hgemv_kernel(M, N, gm_a, lda, gm_x, workspace, M1, N1, M0, N0, splict_num);
     }
+    
+    // sync
+#ifdef STANDRAD
+    uint64_t flag_id = 0;
+    uint64_t mode = 0;
+    config = 1 | (mode << 4) | (flag_id << 8);
+    ffts_cross_core_sync(PIPE_FIX, config);
+    wait_flag_dev(flag_id);
+
+    flag_id = 1;
+    mode = 2;
+    config = 1 | (mode << 4) | (flag_id << 8);
+    ffts_cross_core_sync(PIPE_FIX, config);
+#endif
+
 #elif defined(__DAV_C220_VEC__)
-    vfmadd_float2half(workspace, gm_y, alpha, beta, incy);
-    pipe_barrier(PIPE_ALL);
+
+#ifdef STANDRAD
+    set_atomic_none();
+    set_ffts_base_addr((uint64_t)ffts_addr);
+    set_mask_norm();
+    set_vector_mask((uint64_t)-1, (uint64_t)-1);
+
+    uint64_t flag_id = 1;
+    wait_flag_dev(flag_id);
+
+    vfmadd_float2half(trans? N : M, workspace, gm_y, alpha, beta, incy);
+#endif
+
 #endif
 }
 
@@ -426,7 +507,8 @@ int hgemv(
     const __fp16 *beta,
     float *workspace,
     __fp16 *y,
-    int incy)
+    int incy,
+    void *ffts_addr)
 {
     // M1和N1必须能够整除M0，N0, 当内部迭代次数大于1时，M0必须小于M1（trans时N0必须小于N1），且为1/2，1/4等，用于L0双缓冲，要不然连续两次双缓冲会互踩
     int32_t M1 = 1024;
@@ -468,6 +550,7 @@ int hgemv(
             return 1;
         }
     }
+
     ascblasHgemv_kernel<<<core_num, nullptr, stream>>>(
         trans,
         M,
@@ -484,7 +567,8 @@ int hgemv(
         splict_num,
         *alpha,
         *beta,
-        incy);
+        incy,
+        ffts_addr);
     return 0;
 }
 #endif

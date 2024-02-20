@@ -7,6 +7,7 @@ $(OP_NAME).o: $(OP_NAME).cce $(OP_NAME)_utils.h
 	ccec -std=c++17 -c -x cce -O2 $(OP_NAME).cce --cce-aicore-arch=dav-c220 \
 	-I$(CANN_DIR)/compiler/tikcpp/tikcfw -I$(CANN_DIR)/compiler/tikcpp/tikcfw/interface -I${CANN_DIR}/compiler/tikcpp/tikcfw/impl \
 	-o build/$(OP_NAME).o
+	
 main.o: main.cpp
 	g++ -O2 -c main.cpp -fPIC -I$(CANN_DIR)/include -L$(CANN_DIR)/lib64 -o build/main.o -lascendcl
 	

@@ -5,11 +5,13 @@ trans=$1
 M=$2
 N=$3
 lda=$4
-incx=$5
-incy=$6
+alpha=$5
+beta=$6
+incx=$7
+incy=$8
 
 isVerify=0 # 是否验证算子的正确性
-if [[ ${7} == "prof" ]]; then # 执行性能测试不要需要验证正确性
+if [[ ${9} == "prof" ]]; then # 执行性能测试不要需要验证正确性
     isVerify=0
 else
     isVerify=1
@@ -24,18 +26,18 @@ mkdir -p data build
 # source /usr/local/Ascend/ascend-toolkit/set_env.sh
 set -e
 CANN_DIR=${ASCEND_HOME_PATH}
-if [[ ${7} != "prof" ]]; then
-    python3 ${OP_NAME}.py --trans $trans -M $M -N $N --lda $lda --incx $incx --incy $incy
+if [[ ${9} != "prof" ]]; then
+    python3 ${OP_NAME}.py --trans $trans -M $M -N $N --lda $lda --alpha $alpha --beta $beta --incx $incx --incy $incy
 fi
 
 make
 
-if [[ ${7} == "prof" ]]; then
+if [[ ${9} == "prof" ]]; then
     rm -rf prof/*
-    msprof --application="./build/${OP_NAME} $trans $M $N $lda $incx $incy $isVerify" --output=./prof --aic-metric=L2Cache
-    python3 prof.py `find ./prof -name "op_*.csv"` $trans $M $N $lda $incx $incy
+    msprof --application="./build/${OP_NAME} $trans $M $N $lda $alpha $beta $incx $incy $isVerify" --output=./prof --aic-metric=L2Cache
+    python3 prof.py `find ./prof -name "op_*.csv"` $trans $M $N $lda $alpha $beta $incx $incy
 else
-    ./build/${OP_NAME} $trans $M $N $lda $incx $incy $isVerify
+    ./build/${OP_NAME} $trans $M $N $lda $alpha $beta $incx $incy $isVerify
 fi
 
 # 删除不需要的数据和中间文件
