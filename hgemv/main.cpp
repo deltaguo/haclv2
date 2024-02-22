@@ -19,18 +19,21 @@ bool compareFp16OutputData(__fp16 *actualOutputData, __fp16 *expectedOutputData,
     int64_t lastError = -1;
     int64_t continuous = 0;
     int64_t maxContinous = 0;
+    double max_abs_error = 0;
+    double max_rel_error = 0;
+    double avg_abs_error = 0;
     int64_t i = 0;
-    float ratios[] = {0.0001, 0.0001};
+    double ratios[] = {0.0001, 0.0001};
     for (i = 0; i < len; i++)
     {
-        float actualOutputItem = *(actualOutputData + i);
-        float expectedOutputItem = *(expectedOutputData + i);
+        double actualOutputItem = *(actualOutputData + i);
+        double expectedOutputItem = *(expectedOutputData + i);
         if (i >= 0 && i < 10)
         {
             printf("our: %f, expected: %f\n", actualOutputItem, expectedOutputItem);
         }
-        float tmp = std::abs((std::min(expectedOutputItem, actualOutputItem)) * ratios[1]);
-        float limitError = tmp;
+        double tmp = std::abs((std::min(expectedOutputItem, actualOutputItem)) * ratios[1]);
+        double limitError = tmp;
         if (std::abs(actualOutputItem - expectedOutputItem) > 0.1 && errorCount < 16)
         {
             std::cout << "index: " << i << " sub super 0.1! actual:" << actualOutputItem << ", expected:" << expectedOutputItem << std::endl;
@@ -52,9 +55,16 @@ bool compareFp16OutputData(__fp16 *actualOutputData, __fp16 *expectedOutputData,
             }
             lastError = i;
         }
-        error += std::min((float)1, std::abs((actualOutputItem - expectedOutputItem) / std::min(expectedOutputItem, actualOutputItem)));
+        max_abs_error = std::max(max_abs_error, std::abs(actualOutputItem - expectedOutputItem));
+        max_rel_error = std::max(max_rel_error, std::abs((actualOutputItem - expectedOutputItem) / std::min(expectedOutputItem, actualOutputItem)));
+        avg_abs_error += std::abs(actualOutputItem - expectedOutputItem);
+        error += std::min((double)1, std::abs((actualOutputItem - expectedOutputItem) / std::min(expectedOutputItem, actualOutputItem)));
     }
     error = error / len;
+    avg_abs_error = avg_abs_error / len;
+    std::cout << "max_abs_error: " << max_abs_error << std::endl;
+    std::cout << "max_rel_error: " << max_rel_error << std::endl;
+    std::cout << "avg_abs_error: " << avg_abs_error << std::endl;
     std::cout << "error: " << error << std::endl;
     if (i == len - 1)
     {
@@ -220,7 +230,13 @@ int main(int argc, char **argv)
     if (isVerify)
     {
         CALL_RT(aclrtMemcpy(vectorY_Host, result_len * incy * sizeof(__fp16), vectorY_Device, result_len * incy * sizeof(__fp16), ACL_MEMCPY_DEVICE_TO_HOST));
-        // CALL_RT(aclrtMemcpy(matrixA_Host, result_len * incy * sizeof(float), workspace, result_len * incy * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
+        //CALL_RT(aclrtMemcpy(vectorY_Host, result_len * incy * sizeof(float), workspace, result_len * incy * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
+        // std::cout << std::endl;
+        // __fp16* vectorY_fp16 =  new __fp16[result_len*incy];
+        // for(int i = 0;i<result_len*incy;++i){
+        //     vectorY_fp16[i] = ((float*)vectorY_Host)[i];
+        // }
+
         // printf("A: \n");
         // for(int i = 0;i<512;++i){
         //     printf("%f ", ((float*)matrixA_Host)[i]);
@@ -262,11 +278,7 @@ int main(int argc, char **argv)
         // {
         //     printf("%.2f ", vectorR[j]);
         // }
-        // std::cout << std::endl;
-        // __fp16* vectorY_fp16 =  new __fp16[result_len*incy];
-        // for(int i = 0;i<result_len*incy;++i){
-        //     vectorY_fp16[i] = ((float*)vectorY_Host)[i];
-        // }
+
         if (compareFp16OutputData(vectorY_Host, vectorR, result_len * incy))
         {
             std::cout << "correct!" << std::endl;
