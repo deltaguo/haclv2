@@ -6,9 +6,6 @@
 
 #include "hgemv_utils.h"
 
-#define STANDRAD
-
-#if defined(__DAV_C220_CUBE__)
 __aicore__ __inline__ void dynamic_op_hgemv_kernel(
     int64_t M,
     int64_t N,
@@ -345,206 +342,35 @@ __aicore__ __inline__ void dynamic_op_hgevm_kernel(
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE);
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID_L02GM_BEFORE_CUBE + 1);
 }
-#endif
 
-#if defined(__DAV_C220_VEC__)
-__aicore__ __inline__ void vfmadd_float2half(
-    int64_t length,
-    __gm__ float *__restrict__ workspace,
-    __gm__ __fp16 *__restrict__ gm_y,
-    __fp16 alpha,
-    __fp16 beta,
-    int64_t incy)
-{
-    int vec_id = get_block_idx() * get_subblockdim() + get_subblockid();
-
-    int64_t sub_len = 256;
-    auto x_fp32 = reinterpret_cast<__ubuf__ float *>((uintptr_t)(0));
-    auto y_fp32 = reinterpret_cast<__ubuf__ float *>((uintptr_t)(sub_len * 4));
-    auto x_fp16 = reinterpret_cast<__ubuf__ half *>((uintptr_t)(sub_len * 8));
-    auto y_fp16 = reinterpret_cast<__ubuf__ half *>((uintptr_t)(sub_len * 10));
-
-    int loop = (length - 1) / sub_len + 1;
-    int remain = length % sub_len;
-
-    int real_sub_len = sub_len;
-    //copy_gm_to_ubuf(y_fp16, gm_y, 0, 1, 1, 0, 0); //y->ub
-    for(int loop_idx = 0; loop_idx < loop; ++loop_idx){
-        if(loop_idx % (get_block_num()*get_subblockdim()) != vec_id)
-            continue;
-
-        if(remain && loop_idx == loop - 1){
-            real_sub_len = remain;
-        }
-        int offset = loop_idx * sub_len;
-        copy_gm_to_ubuf(y_fp16, gm_y + offset, 0, 1, (real_sub_len-1) / 16 + 1, 0, 0); //y->ub
-        set_flag(PIPE_MTE2, PIPE_V, 0);
-
-        copy_gm_to_ubuf(x_fp32, workspace + offset, 0, 1, sub_len / 8, 0, 0); //x->ub
-        set_flag(PIPE_MTE2, PIPE_V, 1);
-
-        wait_flag(PIPE_MTE2, PIPE_V, 0);
-        CastImpl(y_fp32, y_fp16, AscendC::RoundMode::CAST_NONE, sub_len); //y fp16->fp32
-        pipe_barrier(PIPE_V);
-        vmuls(y_fp32, y_fp32, (float)beta, sub_len / 64, 1, 1, 8, 8); // y=*beta
-        wait_flag(PIPE_MTE2, PIPE_V, 1);
-        pipe_barrier(PIPE_V);
-        vaxpy(y_fp32, x_fp32, (float)alpha, sub_len / 64, 1, 1, 8, 8); //y = x*alpha
-        pipe_barrier(PIPE_V);
-        CastImpl(y_fp16, y_fp32, AscendC::RoundMode::CAST_NONE, sub_len); //y fp32->fp16
-        set_flag(PIPE_V, PIPE_MTE3, 0);
-        wait_flag(PIPE_V, PIPE_MTE3, 0);
-        copy_ubuf_to_gm(gm_y + offset, y_fp16, 0, 1, real_sub_len / 16, 0, 0); // ub->y
-        set_flag(PIPE_MTE3, PIPE_S, 0);
-        wait_flag(PIPE_MTE3, PIPE_S, 0);
-        int sub_remain = real_sub_len % 16;
-        for(int i = 0; i < sub_remain; ++i){
-            *(gm_y + offset + real_sub_len / 16 * 16 + i) = *(y_fp16 + real_sub_len / 16 * 16 + i);
-        }
-    }
-}
-#endif
-
-__global__ __aicore__ void ascblasHgemv_kernel(
-    int64_t trans,
-    int64_t M,
-    int64_t N,
+extern "C" __global__ __aicore__ void ascblasHgemv_kernel(
     __gm__ T_INPUT *__restrict__ gm_a,
-    int64_t lda,
     __gm__ T_INPUT *__restrict__ gm_x,
-    __gm__ float *__restrict__ workspace,
-    __gm__ __fp16 *__restrict__ gm_y,
-    const int64_t M1,
-    const int64_t N1,
-    const int64_t M0,
-    const int64_t N0,
-    const int64_t splict_num,
-    __fp16 alpha,
-    __fp16 beta,
-    int64_t incy,
-    __gm__ void* ffts_addr)
+    __gm__ T_OUTPUT *__restrict__ gm_y,
+    __gm__ uint32_t *__restrict__ tiling_para_gm)
 {
-#if defined(__DAV_C220_CUBE__)
     set_padding(0);
     set_atomic_none();
     uint64_t config = 0x1;
     set_nd_para(config);
-    set_ffts_base_addr((uint64_t)ffts_addr);
+
+    auto tiling_para = reinterpret_cast<__gm__ int32_t *>(tiling_para_gm);
+    int64_t trans = tiling_para[0];
+    int64_t M = tiling_para[1];
+    int64_t N = tiling_para[2];
+    int64_t lda = tiling_para[3];
+    int64_t M1 = tiling_para[4];
+    int64_t N1 = tiling_para[5];
+    int64_t M0 = tiling_para[6];
+    int64_t N0 = tiling_para[7];
+    int64_t splict_num = tiling_para[8];
 
     if (trans)
     {
-        dynamic_op_hgevm_kernel(M, N, gm_a, lda, gm_x, workspace, M1, N1, M0, N0, splict_num);
+        dynamic_op_hgevm_kernel(M, N, gm_a, lda, gm_x, gm_y, M1, N1, M0, N0, splict_num);
     }
     else
     {
-        dynamic_op_hgemv_kernel(M, N, gm_a, lda, gm_x, workspace, M1, N1, M0, N0, splict_num);
+        dynamic_op_hgemv_kernel(M, N, gm_a, lda, gm_x, gm_y, M1, N1, M0, N0, splict_num);
     }
-    
-    // sync
-#ifdef STANDRAD
-    uint64_t flag_id = 0;
-    uint64_t mode = 0;
-    config = 1 | (mode << 4) | (flag_id << 8);
-    ffts_cross_core_sync(PIPE_FIX, config);
-    wait_flag_dev(flag_id);
-
-    flag_id = 1;
-    mode = 2;
-    config = 1 | (mode << 4) | (flag_id << 8);
-    ffts_cross_core_sync(PIPE_FIX, config);
-#endif
-
-#elif defined(__DAV_C220_VEC__)
-
-#ifdef STANDRAD
-    set_atomic_none();
-    set_ffts_base_addr((uint64_t)ffts_addr);
-    set_mask_norm();
-    set_vector_mask((uint64_t)-1, (uint64_t)-1);
-
-    uint64_t flag_id = 1;
-    wait_flag_dev(flag_id);
-
-    vfmadd_float2half(trans? N : M, workspace, gm_y, alpha, beta, incy);
-#endif
-
-#endif
-}
-
-int hgemv(
-    void *stream,
-    int trans,
-    int M,
-    int N,
-    const __fp16 *alpha,
-    const __fp16 *A,
-    int lda,
-    const __fp16 *x,
-    int incx,
-    const __fp16 *beta,
-    float *workspace,
-    __fp16 *y,
-    int incy,
-    void *ffts_addr)
-{
-    // M1和N1必须能够整除M0，N0, 当内部迭代次数大于1时，M0必须小于M1（trans时N0必须小于N1），且为1/2，1/4等，用于L0双缓冲，要不然连续两次双缓冲会互踩
-    int32_t M1 = 1024;
-    int32_t N1 = 64;
-    int32_t M0 = 512;
-    int32_t N0 = 32;
-
-    int32_t M1_tile_num_of_M = (M + M1 - 1) / M1; // M方向块数
-    int32_t splict_num = trans ? 1 : 4;
-    int32_t block_num = M1_tile_num_of_M * splict_num;
-    int32_t core_num = 20;                    // blockDim < 20 ? blockDim : 20;
-    int32_t M_round = (M + 16 - 1) / 16 * 16; // M向上取整为16倍数
-    int32_t N_round = (N + 16 - 1) / 16 * 16; // N向上取整为16倍数
-    M1 = M_round < M1 ? M_round : M1;         // 基块大小，上限为(256,256)，下限为(M_round, N_round)
-    N1 = N_round < N1 ? N_round : N1;
-    M0 = M1 < M0 ? M1 : M0; // M0, N0要小于M1, N1
-    N0 = N1 < N0 ? N1 : N0;
-    printf("tiling: M1=%d, N1=%d, M0=%d, N0=%d, splict_num: %d\n", M1, N1, M0, N0, splict_num);
-
-    if (M1 % M0 || N1 % N0)
-    {
-        printf("M1 and N1 must be able to divide M0, N0!\n");
-        return 1;
-    }
-
-    if (!trans)
-    {
-        if (M1 * N1 / (M0 * N0) > 1 && M0 == M1)
-        {
-            printf("L0 double buffer error!\n");
-            return 1;
-        }
-    }
-    else
-    {
-        if (M1 * N1 / (M0 * N0) > 1 && N0 == N1)
-        {
-            printf("L0 double buffer error!\n");
-            return 1;
-        }
-    }
-
-    ascblasHgemv_kernel<<<core_num, nullptr, stream>>>(
-        trans,
-        M,
-        N,
-        (__gm__ T_INPUT *__restrict__)A,
-        lda,
-        (__gm__ T_INPUT *__restrict__)x,
-        (__gm__ T_OUTPUT *__restrict__)workspace,
-        (__gm__ __fp16 *__restrict__)y,
-        M1,
-        N1,
-        M0,
-        N0,
-        splict_num,
-        *alpha,
-        *beta,
-        incy,
-        ffts_addr);
-    return 0;
 }

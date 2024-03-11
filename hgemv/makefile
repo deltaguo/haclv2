@@ -15,8 +15,8 @@ $(OP_NAME): $(OP_NAME).cce main.cpp
 	ccec -o build/$(OP_NAME) build/main.o build/$(OP_NAME).o --cce-fatobj-link -L$(CANN_DIR)/lib64 -lascendcl -lruntime -lstdc++
 
 ca:	$(OP_NAME).cce
-	ccec -std=c++17 -c -O2 ${OP_NAME}.cce -DCAMODEL -o build/${OP_NAME}_ca.o \
-	--cce-aicore-arch=dav-c220 --cce-aicore-only \
+	ccec -std=c++17 -c -O2 ${OP_NAME}_ca.cce -DCAMODEL -o build/${OP_NAME}_ca.o \
+	--cce-aicore-arch=dav-c220-cube --cce-aicore-only \
 	-mllvm -cce-aicore-record-overflow=false \
 	-mllvm -cce-aicore-addr-transform \
 	-mllvm --cce-aicore-jump-expand=true

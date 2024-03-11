@@ -4,9 +4,8 @@
 - 2024.1.29 完成splict方案，以float将结果保存在gm上
 - 2024.2.20 完成带有alpha beta的mix算子
 - 接下来
-  1. tiling方案，优化访存
-  2. Incx，incy
-  3. 用vector来算？
+  1. Incx，incy
+  2. 用vector来算？
 
 昇腾910B上的一些要点:
 

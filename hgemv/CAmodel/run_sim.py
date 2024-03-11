@@ -10,8 +10,8 @@ def generate_test_data(M, N):
     return matrix_a, matrix_b, matrix_c
 
 def main():
-    if len(sys.argv[1:]) != 2:
-        print("Invalid arguments, usage: python3 run_sim.py <M> <N> ", file=sys.stderr)
+    if len(sys.argv[1:]) != 3:
+        print("Invalid arguments, usage: python3 run_sim.py <trans> <M> <N> ", file=sys.stderr)
         exit(1)
     
     trans, M, N = [int(arg) for arg in sys.argv[1:]]

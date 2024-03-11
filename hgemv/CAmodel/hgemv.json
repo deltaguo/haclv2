@@ -1,5 +1,5 @@
 {
     "blockDim": 1,
-    "kernelName": "dynamic_op_hgemv_kernel",
+    "kernelName": "ascblasHgemv_kernel",
     "magic:": "RT_DEV_BINARY_MAGIC_ELF_AICUBE"
 }
