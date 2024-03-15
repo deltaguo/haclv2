@@ -30,7 +30,7 @@ if [[ ${9} != "prof" ]]; then
     python3 ${OP_NAME}.py --trans $trans -M $M -N $N --lda $lda --alpha $alpha --beta $beta --incx $incx --incy $incy
 fi
 
-make
+#make
 
 if [[ ${9} == "prof" ]]; then
     rm -rf prof/*

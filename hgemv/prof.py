@@ -27,3 +27,6 @@ with open(file_path, newline='') as csvfile:
     print(time_us)
 Mflops = 2.0 * M * N * 1e-6
 print("trans: ", trans, "M: ", M, "N: ", N, "lda: ", lda, "incx: ", incx, "alpha: ", alpha, "beta: ", beta, "incy: ", incy, "Tflops: ", Mflops / time_us)
+with open('result.csv','a',newline='') as csvfile:
+    writer = csv.writer(csvfile)
+    writer.writerow([trans, M, N, Mflops / time_us])
