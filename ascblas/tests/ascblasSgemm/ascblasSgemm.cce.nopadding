@@ -1,0 +1,832 @@
+#include "ascblas_type.h"
+
+#ifdef __CCE_KT_TEST__
+#define __aicore__
+#else
+#define __aicore__ [aicore]
+#endif
+// CAmodel 不需要头文件
+#ifndef CAMODEL
+
+#include "kernel_operator.h"
+
+#endif
+
+
+using T_INPUT = float;
+using T_OUTPUT = float;
+
+constexpr int64_t L0AB_PINGPONG_BUFFER_LEN = 32 * 1024 / sizeof(T_INPUT);   // 32KB
+constexpr int64_t L0C_PINGPONG_BUFFER_LEN = 64 * 1024 / sizeof(T_INPUT);    // 64KB
+constexpr int64_t BLOCK_SIZE = 16;
+constexpr int64_t C0_SIZE = 32 / sizeof(T_INPUT);                           
+constexpr int64_t CUBE_MATRIX_SIZE = BLOCK_SIZE * C0_SIZE;                  // 16 * 8
+constexpr int64_t L1_PINGPONG_BUFFER_LEN = 256 * 1024 / sizeof(T_INPUT);    // 256KB
+
+__aicore__ __inline__ void load_matrix_zN(__cbuf__ float *dst, __gm__ float * src,
+    int64_t R, int64_t C, int64_t valid_row, int64_t valid_col, size_t stride)
+{
+    constexpr int C0 = 32 / sizeof(float);
+    constexpr int STRIDE_LIMIT = 65536;
+
+    if(stride < STRIDE_LIMIT) {
+        copy_gm_to_cbuf_multi_nd2nz_b32s(
+            dst,
+            src,
+            static_cast<uint8_t>(0),            // sid
+            static_cast<uint16_t>(1),           // ndNum
+            static_cast<uint16_t>(valid_row),   // nValue
+            static_cast<uint16_t>(valid_col),   // dValue
+            static_cast<uint16_t>(0),           // srcNdMatrixStride
+            static_cast<uint16_t>(stride),      // srcDValue
+            static_cast<uint16_t>(R),           // dstNzC0Stride
+            static_cast<uint16_t>(1),           // dstNzNStride
+            static_cast<uint16_t>(0)           // dstNzMatrixStride
+        );
+    } else {
+        for(int i = 0; i < valid_row; i++) {
+            copy_gm_to_cbuf_multi_nd2nz_b32s(
+                dst + i * C0,
+                src + i * stride,
+                static_cast<uint8_t>(0),            // sid
+                static_cast<uint16_t>(1),           // ndNum
+                static_cast<uint16_t>(1),           // nValue
+                static_cast<uint16_t>(valid_col),   // dValue
+                static_cast<uint16_t>(0),           // srcNdMatrixStride, unused
+                static_cast<uint16_t>(0),           // srcDValue, unused
+                static_cast<uint16_t>(R),           // dstNzC0Stride
+                static_cast<uint16_t>(0),           // dstNzNStride, unused
+                static_cast<uint16_t>(0)           // dstNzMatrixStride, unused
+            );    
+        }
+    }
+}
+
+__aicore__ __inline__ void load_matrix_zZ(__cbuf__ float * dst, __gm__ float *src,
+    int64_t R, int64_t C, int64_t valid_row, int64_t valid_col, size_t stride)
+{
+    constexpr int R0 = 16;
+    constexpr int C0 = 32 / sizeof(float);
+    constexpr int STRIDE_LIMIT = 65536;
+
+    int64_t srcNdStride = R0 * stride;
+    int64_t srcNStride = stride;
+    if(srcNdStride < STRIDE_LIMIT) {
+        int ndNum = valid_row / R0;
+        int remains = valid_row % R0;
+        if(ndNum > 0) {
+            copy_gm_to_cbuf_multi_nd2nz_b32s(
+                dst,
+                src,
+                static_cast<uint8_t>(0),            // sid
+                static_cast<uint16_t>(ndNum),       // ndNum
+                static_cast<uint16_t>(R0),          // nValue
+                static_cast<uint16_t>(valid_col),   // dValue
+                static_cast<uint16_t>(srcNdStride), // srcNdMatrixStride
+                static_cast<uint16_t>(srcNStride),  // srcDValue
+                static_cast<uint16_t>(R0),          // dstNzC0Stride
+                static_cast<uint16_t>(1),           // dstNzNStride
+                static_cast<uint16_t>(R0 * C)      // dstNzMatrixStride
+            );
+        }
+        if(remains > 0){
+            copy_gm_to_cbuf_multi_nd2nz_b32s(
+                dst + ndNum * R0 * C,
+                src + ndNum * R0 * stride,
+                static_cast<uint8_t>(0),            // sid
+                static_cast<uint16_t>(1),           // ndNum
+                static_cast<uint16_t>(remains),     // nValue
+                static_cast<uint16_t>(valid_col),   // dValue
+                static_cast<uint16_t>(0),           // srcNdMatrixStride
+                static_cast<uint16_t>(srcNStride),  // srcDValue
+                static_cast<uint16_t>(R0),          // dstNzC0Stride
+                static_cast<uint16_t>(1),           // dstNzNStride
+                static_cast<uint16_t>(0)           // dstNzMatrixStride
+            );
+        }
+    } else if (srcNStride < STRIDE_LIMIT) {
+        int ndNum = valid_row / R0;
+        int remains = valid_row % R0;
+        for (int i = 0; i < ndNum; i++) {
+            copy_gm_to_cbuf_multi_nd2nz_b32s(
+                dst + i * R0 * C,
+                src + i * R0 * stride,
+                static_cast<uint8_t>(0),            // sid
+                static_cast<uint16_t>(1),           // ndNum
+                static_cast<uint16_t>(R0),          // nValue
+                static_cast<uint16_t>(valid_col),   // dValue
+                static_cast<uint16_t>(0),           // srcNdMatrixStride
+                static_cast<uint16_t>(srcNStride),  // srcDValue
+                static_cast<uint16_t>(R0),          // dstNzC0Stride
+                static_cast<uint16_t>(1),           // dstNzNStride
+                static_cast<uint16_t>(0)           // dstNzMatrixStride
+            );
+        }
+        if(remains > 0) {
+            copy_gm_to_cbuf_multi_nd2nz_b32s(
+                dst + ndNum * R0 * C,
+                src + ndNum * R0 * stride,
+                static_cast<uint8_t>(0),            // sid
+                static_cast<uint16_t>(1),           // ndNum
+                static_cast<uint16_t>(remains),     // nValue
+                static_cast<uint16_t>(valid_col),   // dValue
+                static_cast<uint16_t>(0),           // srcNdMatrixStride
+                static_cast<uint16_t>(srcNStride),  // srcDValue
+                static_cast<uint16_t>(R0),          // dstNzC0Stride
+                static_cast<uint16_t>(1),           // dstNzNStride
+                static_cast<uint16_t>(0)           // dstNzMatrixStride
+            );
+        }
+    } else {
+        for(int i = 0; i < valid_row; i++) {
+            int idxR0 = i / R0;
+            int idxInR0 = i % R0;
+            copy_gm_to_cbuf_multi_nd2nz_b32s(
+                dst + idxR0 * R0 * C + idxInR0 * C0,
+                src + i * stride,
+                static_cast<uint8_t>(0),            // sid
+                static_cast<uint16_t>(1),           // ndNum
+                static_cast<uint16_t>(1),           // nValue
+                static_cast<uint16_t>(valid_col),   // dValue
+                static_cast<uint16_t>(0),           // srcNdMatrixStride, unused
+                static_cast<uint16_t>(0),           // srcDValue, unused
+                static_cast<uint16_t>(R0),          // dstNzC0Stride
+                static_cast<uint16_t>(0),           // dstNzNStride, unused
+                static_cast<uint16_t>(0)           // dstNzMatrixStride, unused
+            );
+        }
+    }
+}
+
+__aicore__ __inline__ void gm2ubuf_matrix(
+    __ubuf__ float * dst, 
+    __gm__ float *src,
+    int64_t valid_col,
+    int64_t valid_row,
+    size_t srcStride,
+    size_t dstStride)
+{
+    int64_t valid_row_round = (valid_row + C0_SIZE - 1) / C0_SIZE * C0_SIZE;
+    constexpr int STRIDE_LIMIT = 65536;
+    if (srcStride % C0_SIZE == 0 && srcStride < STRIDE_LIMIT) {
+        copy_gm_to_ubuf(
+            dst,
+            src,
+            0,                                        // sid
+            valid_col,                                // nBurst
+            valid_row_round / C0_SIZE,                // lenBurst
+            (srcStride - valid_row_round) / C0_SIZE,  // srcGap
+            (dstStride - valid_row_round) / C0_SIZE   // dstGap
+        );
+    } else if (srcStride * C0_SIZE < STRIDE_LIMIT) {
+        int C0_SIZE_loop = valid_col / C0_SIZE;
+        int C0_SIZE_remain = valid_col % C0_SIZE;
+        if (C0_SIZE_loop > 0) {
+            for (int i = 0; i < C0_SIZE; i++) {
+                copy_gm_to_ubuf(
+                    dst + i * dstStride,
+                    src + i * srcStride,
+                    0,                             // sid
+                    C0_SIZE_loop,                  // nBurst
+                    valid_row_round / C0_SIZE,     // lenBurst
+                    (srcStride * C0_SIZE - valid_row_round) / C0_SIZE,  // srcGap
+                    (dstStride * C0_SIZE - valid_row_round) / C0_SIZE   // dstGap
+                );
+            }
+        }
+        for (int i = 0; i < C0_SIZE_remain; i++) {
+            copy_gm_to_ubuf(
+                dst + C0_SIZE_loop * C0_SIZE * dstStride + i * dstStride,
+                src + C0_SIZE_loop * C0_SIZE * srcStride + i * srcStride,
+                0,                             // sid
+                1,                             // nBurst
+                valid_row_round / C0_SIZE,     // lenBurst
+                0,  // srcGap
+                0   // dstGap
+            );
+        }
+    } else {
+        for (int i = 0; i < valid_col; i++) {
+            copy_gm_to_ubuf(
+                dst + i * dstStride,
+                src + i * srcStride,
+                0,                             // sid
+                1,                             // nBurst
+                valid_row_round / C0_SIZE,     // lenBurst
+                0,                             // srcGap
+                0                              // dstGap
+            );
+        }
+    }
+}
+
+__aicore__ __inline__ void ubuf2gm_matrix(
+    __gm__ float * dst, 
+    __ubuf__ float *src,
+    int64_t valid_col,
+    int64_t valid_row,
+    size_t srcStride,
+    size_t dstStride) 
+{
+    int64_t valid_row_round = (valid_row + C0_SIZE - 1) / C0_SIZE * C0_SIZE;
+    constexpr int STRIDE_LIMIT = 65536;
+    if (valid_row % C0_SIZE == 0 && dstStride % C0_SIZE == 0 && dstStride < STRIDE_LIMIT) {
+        copy_ubuf_to_gm(
+            dst,
+            src,
+            0,                                        // sid
+            valid_col,                                // nBurst
+            valid_row_round / C0_SIZE,                // lenBurst
+            (srcStride - valid_row_round) / C0_SIZE,  // srcGap
+            (dstStride - valid_row_round) / C0_SIZE   // dstGap
+        );
+    } else if (valid_row % C0_SIZE == 0 && dstStride * C0_SIZE < STRIDE_LIMIT) {
+        int C0_SIZE_loop = valid_col / C0_SIZE;
+        int C0_SIZE_remain = valid_col % C0_SIZE;
+        if (C0_SIZE_loop > 0) {
+            for (int i = 0; i < C0_SIZE; i++) {
+                copy_ubuf_to_gm(
+                    dst + i * dstStride,
+                    src + i * srcStride,
+                    0,                                            // sid
+                    C0_SIZE_loop,                                 // nBurst
+                    valid_row / C0_SIZE,                          // lenBurst
+                    (srcStride * C0_SIZE - valid_row) / C0_SIZE,  // srcGap
+                    (dstStride * C0_SIZE - valid_row) / C0_SIZE   // dstGap
+                );
+            }
+        }
+        for (int i = 0; i < C0_SIZE_remain; i++) {
+            copy_ubuf_to_gm(
+                dst + C0_SIZE_loop * C0_SIZE * dstStride + i * dstStride,
+                src + C0_SIZE_loop * C0_SIZE * srcStride + i * srcStride,
+                0,                             // sid
+                1,                             // nBurst
+                valid_row / C0_SIZE,     // lenBurst
+                0,  // srcGap
+                0   // dstGap
+            );
+        }
+    } else {
+        for (int i = 0; i < valid_col; i++) {
+             copy_ubuf_to_gm_align_b32(
+                dst + i * dstStride,
+                src + i * srcStride,
+                0,                             // sid
+                1,                             // nBurst
+                valid_row * sizeof(T_OUTPUT),  // lenBurst
+                0,
+                0,
+                0,                             // srcGap
+                0                              // dstGap
+            );
+        }
+    }
+}
+
+
+
+#if __DAV_C220_CUBE__
+
+// CAmodel 需要将参数写入到tiling_para_gm中
+#ifdef CAMODEL
+extern "C" __global__ __aicore__ void ascblasSgemm_kernel_mix_aic(
+    __gm__ T_INPUT * __restrict__ gm_A,
+    __gm__ T_INPUT * __restrict__ gm_B,
+    __gm__ T_OUTPUT * __restrict__ gm_C,
+    __gm__ T_OUTPUT * __restrict__ workspace,
+    __gm__ uint8_t * __restrict__ ffts_addr,
+    __gm__ uint32_t * __restrict__ tiling_para_gm)
+#else
+extern "C" __global__ __aicore__ void ascblasSgemm_kernel_mix_aic(
+    ascblasOperation_t transA,
+    ascblasOperation_t transB,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    float alpha,
+    __gm__ T_INPUT * __restrict__ gm_A,
+    int64_t lda,
+    __gm__ T_INPUT * __restrict__ gm_B,
+    int64_t ldb,
+    float beta,
+    __gm__ T_OUTPUT * __restrict__ gm_C,
+    int64_t ldc,
+    int64_t batchSize,
+    int64_t M0,
+    int64_t N0,
+    int64_t K0,
+    __gm__ T_OUTPUT * __restrict__ workspace,
+    __gm__ uint8_t * __restrict__ ffts_addr)
+#endif
+{
+    set_ffts_base_addr((uint64_t)ffts_addr);
+    set_padding(0);
+    set_atomic_none();
+    set_nd_para(0x1);
+// CAmodel 从tiling_para_gm解析出参数
+#ifdef CAMODEL
+    // get tiling args
+    auto tiling_para = reinterpret_cast<__gm__ int32_t *>(tiling_para_gm);
+    int64_t batchSize = tiling_para[0];
+    ascblasOperation_t transA = tiling_para[1] == 0 ? ASCBLAS_OP_N : ASCBLAS_OP_T;
+    ascblasOperation_t transB = tiling_para[2] == 0 ? ASCBLAS_OP_N : ASCBLAS_OP_T;
+    int64_t M = tiling_para[3];
+    int64_t N = tiling_para[4];
+    int64_t K = tiling_para[5];
+    int64_t lda = tiling_para[6];
+    int64_t ldb = tiling_para[7];
+    int64_t ldc = tiling_para[8];
+    int64_t M0 = tiling_para[9];
+    int64_t N0 = tiling_para[10];
+    int64_t K0 = tiling_para[11];
+    float alpha = ((__gm__ float *)tiling_para)[12];
+    float beta = ((__gm__ float *)tiling_para)[13];
+#endif
+
+    auto l1_base_a = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)0);            // 128 KB
+    auto l1_base_b = reinterpret_cast<__cbuf__ T_INPUT *>((uintptr_t)(128 * 1024)); // 128 KB
+
+    auto l0a_base = reinterpret_cast<__ca__ T_INPUT *>((uintptr_t)0);
+    auto l0b_base = reinterpret_cast<__cb__ T_INPUT *>((uintptr_t)0);
+    auto l0c_base = reinterpret_cast<__cc__ float *>((uintptr_t)0);
+    // auto l0c_buf = reinterpret_cast<__cc__ float *>((uintptr_t)0);
+
+    int64_t m_loop = (M + M0 - 1) / M0;
+    int64_t n_loop = (N + N0 - 1) / N0;
+    int64_t k_loop = (K + K0 - 1) / K0;
+    int64_t loop = batchSize * m_loop * n_loop;
+
+    int64_t l0c_ping_flag = 1;
+    int64_t ping_flag = 1;
+    uint64_t flag_id;
+    uint64_t mode;
+    uint64_t AIV_AIC_config;
+
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+    
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+
+    for (int64_t loop_idx = 0; loop_idx < loop; loop_idx++) {
+        if (loop_idx % get_block_num() != get_block_idx()) {
+            continue;
+        }
+
+        auto l0c_buf = l0c_ping_flag ? l0c_base + L0C_PINGPONG_BUFFER_LEN : l0c_base;
+        auto l0c_EVENT_ID = l0c_ping_flag ? EVENT_ID0 : EVENT_ID1;
+
+        int64_t batch_idx = loop_idx / (m_loop * n_loop);
+        int64_t in_batch_idx = loop_idx % (m_loop * n_loop);
+        int64_t m_idx;
+        int64_t n_idx;
+
+        constexpr int N_COL = 16;
+        int tile_block_loop = (n_loop + N_COL - 1) / N_COL;
+        int tile_block_idx = in_batch_idx / (N_COL * m_loop);
+        int in_tile_block_idx = in_batch_idx % (N_COL * m_loop);
+        int n_col = N_COL;
+        if(tile_block_idx == tile_block_loop - 1) {
+            n_col = n_loop - N_COL * tile_block_idx;
+        }
+        m_idx = in_tile_block_idx / n_col;
+        n_idx = tile_block_idx * N_COL + in_tile_block_idx % n_col;
+        // m_idx = in_batch_idx / n_loop;
+        // n_idx = in_batch_idx % n_loop;
+
+        int64_t offset_a, offset_b;
+        int64_t offset_c = batch_idx * ldc * N + m_idx * M0 + n_idx * N0 * ldc;
+        int64_t m_actual = (m_idx == (m_loop - 1)) ? (M - m_idx * M0) : M0;
+        int64_t n_actual = (n_idx == (n_loop - 1)) ? (N - n_idx * N0) : N0;
+        int64_t m_round = (m_actual + 15) / 16 * 16;
+        int64_t n_round = (n_actual + 15) / 16 * 16;
+
+        int64_t mn_max = m_round > n_round ? m_round : n_round;
+        int64_t k_part_len = L0AB_PINGPONG_BUFFER_LEN / mn_max / 16 * 16;
+
+        for (int64_t k_idx = 0; k_idx < k_loop; k_idx++) {
+            if(transA == ASCBLAS_OP_T) {
+                offset_a = batch_idx * M * lda + k_idx * K0 + m_idx * M0 * lda;
+            } else {
+                offset_a = batch_idx * lda * K + m_idx * M0 + k_idx * K0 * lda;
+            }
+
+            if(transB == ASCBLAS_OP_T) {
+                offset_b = batch_idx * K * ldb + n_idx * N0 + k_idx * K0 * ldb;
+            } else {
+                offset_b = batch_idx * ldb * N + k_idx * K0 + n_idx * N0 * ldb;
+            }
+
+            int64_t k_actual = (k_idx == (k_loop - 1)) ? (K - k_idx * K0) : K0;
+            int64_t k_round = (k_actual + 15) / 16 * 16;
+            int64_t k_part_loop = (k_actual + k_part_len - 1) / k_part_len;
+
+            auto l1_buf_a = ping_flag ? l1_base_a : l1_base_a + L1_PINGPONG_BUFFER_LEN;
+            auto l1_buf_b = ping_flag ? l1_base_b : l1_base_b + L1_PINGPONG_BUFFER_LEN;
+            auto event_id = ping_flag ? EVENT_ID0 : EVENT_ID1;
+
+            // *** load matrix A to L1
+            wait_flag(PIPE_MTE1, PIPE_MTE2, event_id);
+            if (transA == ASCBLAS_OP_T) {
+                load_matrix_zN(l1_buf_a, gm_A + offset_a, M0, K0, m_actual, k_actual, lda);
+            } else {
+                load_matrix_zZ(l1_buf_a, gm_A + offset_a, K0, M0, k_actual, m_actual, lda);
+            }
+            set_flag(PIPE_MTE2, PIPE_MTE1, event_id);
+            
+
+            // *** load matrix B to L1
+            wait_flag(PIPE_MTE1, PIPE_MTE2, event_id + 2);
+            if (transB == ASCBLAS_OP_T) {
+                load_matrix_zZ(l1_buf_b, gm_B + offset_b, K0, N0, k_actual, n_actual, ldb);
+            } else {
+                load_matrix_zN(l1_buf_b, gm_B + offset_b, N0, K0, n_actual, k_actual, ldb);
+            }
+
+            set_flag(PIPE_MTE2, PIPE_MTE1, event_id + 2);
+
+            for (int k_part_idx = 0; k_part_idx < k_part_loop; k_part_idx++) {
+                int64_t k0_round = (k_part_idx < k_part_loop - 1) ? k_part_len : k_round - k_part_idx * k_part_len;
+                int64_t k0_actual = (k_part_idx < k_part_loop - 1) ? k_part_len : k_actual - k_part_idx * k_part_len;
+            
+                auto mte1_mad_ping_flag = 1 - k_part_idx % 2;
+                auto mte1_mad_event_id = mte1_mad_ping_flag ? EVENT_ID0 : EVENT_ID1;
+                auto l0a_buf = l0a_base + (k_part_idx % 2) * L0AB_PINGPONG_BUFFER_LEN;
+                auto l0b_buf = l0b_base + (k_part_idx % 2) * L0AB_PINGPONG_BUFFER_LEN;
+            
+                // *** load matrix A from L1 to L0B
+                if (k_part_idx == 0) {
+                    wait_flag(PIPE_MTE2, PIPE_MTE1, event_id);
+                }
+                wait_flag(PIPE_M, PIPE_MTE1, mte1_mad_event_id);
+
+                if (transA == ASCBLAS_OP_T) {
+                    auto l1_src_a = l1_buf_a + k_part_idx * k_part_len * M0;
+                    for (int i = 0; i < k0_round / C0_SIZE; i++) {
+                        load_cbuf_to_cb(
+                            l0b_buf + i * m_round * C0_SIZE,
+                            l1_src_a + i * C0_SIZE * M0,
+                            0,                              // baseIdx
+                            m_round / BLOCK_SIZE,           // repeat
+                            1,                              // srcStride
+                            0,                              // dstStride
+                            0,                              // sid
+                            false,                          // transpose
+                            inc                             // addr_cal_mode_t
+                        );
+                    }
+                } else {
+                    auto l1_src_a = l1_buf_a + k_part_idx * k_part_len * M0;
+                    for (int i = 0; i < m_round / BLOCK_SIZE; i++) {
+                        load_cbuf_to_cb_transpose(
+                            l0b_buf + i * CUBE_MATRIX_SIZE,
+                            l1_src_a + i * 2 * CUBE_MATRIX_SIZE,
+                            0,                              // indexID
+                            k0_round / BLOCK_SIZE,          // repeat
+                            M0 / BLOCK_SIZE,                // srcStride
+                            2 * m_round / BLOCK_SIZE - 1,   // dstStride
+                            inc,                            // addrmode
+                            m_round / BLOCK_SIZE - 1        // dstFracStride
+                        );
+                    }
+                }
+
+                if (k_part_idx == k_part_loop - 1) {
+                    set_flag(PIPE_MTE1, PIPE_MTE2, event_id);
+                }
+
+                // *** load matrix B from L1 to L0B
+                if (k_part_idx == 0) {
+                    wait_flag(PIPE_MTE2, PIPE_MTE1, event_id + 2);
+                }
+                if (transB == ASCBLAS_OP_T) {
+                    auto l1_src_b = l1_buf_b + k_part_idx * k_part_len * N0;
+                    for (int i = 0; i < n_round / BLOCK_SIZE; i++) {
+                        load_cbuf_to_ca_transpose(
+                            l0a_buf + i * k0_round * BLOCK_SIZE,
+                            l1_src_b + i * 2 * CUBE_MATRIX_SIZE,
+                            0,                              // indexID
+                            k0_round / BLOCK_SIZE,          // repeat
+                            N0 / BLOCK_SIZE,                // srcStride
+                            1,                              // dstStride
+                            inc,                            // addrmode
+                            0                               // dstFracStride
+                        );
+                    }
+                } else {
+                    auto l1_src_b = l1_buf_b + k_part_idx * k_part_len * N0;
+                    for (int i = 0; i < n_round / BLOCK_SIZE; i++) {
+                        load_cbuf_to_ca(
+                            l0a_buf + i * k0_round * BLOCK_SIZE,
+                            l1_src_b + i * CUBE_MATRIX_SIZE,
+                            0,                              // baseIdx
+                            k0_round / C0_SIZE,             // repeat
+                            N0 / BLOCK_SIZE,                              // srcStride
+                            0,                              // dstStride
+                            0,                              // sid
+                            false,                          // transpose
+                            inc                             // addr_cal_mode_t
+                        );
+                    }
+                }
+                if (k_part_idx == k_part_loop - 1) {
+                    set_flag(PIPE_MTE1, PIPE_MTE2, event_id + 2);
+                }
+
+                set_flag(PIPE_MTE1, PIPE_M, mte1_mad_event_id);
+                wait_flag(PIPE_MTE1, PIPE_M, mte1_mad_event_id);
+
+                bool init_c = (k_idx == 0 && k_part_idx == 0);
+                if (init_c) {
+                    wait_flag(PIPE_FIX, PIPE_M, l0c_EVENT_ID);
+                }
+
+                mad(l0c_buf,
+                    l0a_buf,
+                    l0b_buf,
+                    n_actual,                       // m
+                    k0_actual,                      // k
+                    m_actual,                       // n
+                    0,                              // unitFlag
+                    1,                              // kDirectionAlign
+                    0,                              // cmatrixSource
+                    init_c                          // cmatrixInitVal
+                );
+                
+                pipe_barrier(PIPE_M);
+                set_flag(PIPE_M, PIPE_MTE1, mte1_mad_event_id);
+            }
+            ping_flag = 1 - ping_flag;
+        }
+
+        set_flag(PIPE_M, PIPE_FIX, l0c_EVENT_ID);
+        wait_flag(PIPE_M, PIPE_FIX, l0c_EVENT_ID);
+
+        // // copy from L0C to gm
+        // copy_matrix_cc_to_gm(
+        //     gm_C + offset_c,
+        //     l0c_buf,
+        //     0,          // sid
+        //     m_actual,   // NSize
+        //     n_actual,   // MSize
+        //     ldc,          // dstStride_dst_D
+        //     n_round,    // srcStride
+        //     0,          // UnitFlagMode
+        //     NoQuant,    // QuantPRE
+        //     0,          // ReLUPRE
+        //     false,      // channelSplit
+        //     true        // NZ2ND_EN
+        // );
+
+        // copy from L0C to gm
+        copy_matrix_cc_to_gm(
+            workspace + (get_block_idx() * 2 + l0c_ping_flag) * M0 * N0,
+            l0c_buf,
+            0,          // sid
+            m_actual,   // NSize
+            n_actual,   // MSize
+            M0,          // dstStride_dst_D
+            n_round,    // srcStride
+            0,          // UnitFlagMode
+            NoQuant,    // QuantPRE
+            0,          // ReLUPRE
+            false,      // channelSplit
+            true        // NZ2ND_EN
+        );
+
+        flag_id = l0c_ping_flag;
+        mode = 2;
+        AIV_AIC_config = 1 | (mode << 4) | (flag_id << 8);
+        ffts_cross_core_sync(PIPE_FIX, AIV_AIC_config);
+
+        l0c_ping_flag = 1 - l0c_ping_flag;
+
+        set_flag(PIPE_FIX, PIPE_M, l0c_EVENT_ID);
+    }
+
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+
+    pipe_barrier(PIPE_ALL);
+}
+
+#elif __DAV_C220_VEC__
+
+#ifdef CAMODEL
+extern "C" __global__ __aicore__ void ascblasSgemm_kernel_mix_aiv(
+    __gm__ T_INPUT * __restrict__ gm_A,
+    __gm__ T_INPUT * __restrict__ gm_B,
+    __gm__ T_OUTPUT * __restrict__ gm_C,
+    __gm__ T_INPUT * __restrict__ workspace,
+    __gm__ uint8_t * __restrict__ ffts_addr,
+    __gm__ uint32_t * __restrict__ tiling_para_gm)
+#else
+extern "C" __global__ __aicore__ void ascblasSgemm_kernel_mix_aiv(
+    ascblasOperation_t transA,
+    ascblasOperation_t transB,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    float alpha,
+    __gm__ T_INPUT * __restrict__ gm_A,
+    int64_t lda,
+    __gm__ T_INPUT * __restrict__ gm_B,
+    int64_t ldb,
+    float beta,
+    __gm__ T_OUTPUT * __restrict__ gm_C,
+    int64_t ldc,
+    int64_t batchSize,
+    int64_t M0,
+    int64_t N0,
+    int64_t K0,
+    __gm__ T_OUTPUT * __restrict__ workspace,
+    __gm__ uint8_t * __restrict__ ffts_addr)
+#endif
+{
+    set_atomic_none();
+    set_mask_norm();
+    set_ffts_base_addr((uint64_t)ffts_addr);
+    set_vector_mask((uint64_t)-1, (uint64_t)-1);
+#ifdef CAMODEL
+    // get tiling args
+    auto tiling_para = reinterpret_cast<__gm__ int32_t *>(tiling_para_gm);
+    int64_t batchSize = tiling_para[0];
+    ascblasOperation_t transA = tiling_para[1] == 0 ? ASCBLAS_OP_N : ASCBLAS_OP_T;
+    ascblasOperation_t transB = tiling_para[2] == 0 ? ASCBLAS_OP_N : ASCBLAS_OP_T;
+    int64_t M = tiling_para[3];
+    int64_t N = tiling_para[4];
+    int64_t K = tiling_para[5];
+    int64_t lda = tiling_para[6];
+    int64_t ldb = tiling_para[7];
+    int64_t ldc = tiling_para[8];
+    int64_t M0 = tiling_para[9];
+    int64_t N0 = tiling_para[10];
+    int64_t K0 = tiling_para[11];
+    float alpha = ((__gm__ float *)tiling_para)[12];
+    float beta = ((__gm__ float *)tiling_para)[13];
+#endif
+
+    auto ubufC1 = reinterpret_cast<__ubuf__ T_INPUT *>((uintptr_t)0);           // 32 KB
+    auto ubufC2 = reinterpret_cast<__ubuf__ T_INPUT *>((uintptr_t)(32 * 1024)); // 32 KB
+    auto ubufAB1 = reinterpret_cast<__ubuf__ T_INPUT *>((uintptr_t)(64 * 1024)); // 32 KB
+    auto ubufAB2 = reinterpret_cast<__ubuf__ T_INPUT *>((uintptr_t)(96 * 1024)); // 32 KB
+    auto ubufD1 = reinterpret_cast<__ubuf__ T_INPUT *>((uintptr_t)(128 * 1024)); // 32 KB
+    auto ubufD2 = reinterpret_cast<__ubuf__ T_INPUT *>((uintptr_t)(160 * 1024)); // 32 KB
+
+    int64_t m_loop = (M + M0 - 1) / M0;
+    int64_t n_loop = (N + N0 - 1) / N0;
+    int64_t k_loop = (K + K0 - 1) / K0;
+    int64_t loop = batchSize * m_loop * n_loop;
+
+    int64_t l0c_ping_flag = 1;
+    int64_t ping_flag = 1;
+    uint64_t flag_id;
+    uint64_t mode;
+    uint64_t AIV_AIC_config;
+
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID2);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
+    
+    for (int64_t loop_idx = 0; loop_idx < loop; loop_idx++) {
+        if (loop_idx % get_block_num() != get_block_idx()) {
+            continue;
+        }
+
+        auto ubufC = l0c_ping_flag ? ubufC1 : ubufC2;
+        auto ubufAB = l0c_ping_flag ? ubufAB1 : ubufAB2;
+        auto ubufD = l0c_ping_flag ? ubufD1 : ubufD2;
+        auto C_EVENT_ID = l0c_ping_flag ? EVENT_ID0 : EVENT_ID1;
+        auto AB_EVENT_ID = l0c_ping_flag ? EVENT_ID2 : EVENT_ID3;
+
+        int64_t batch_idx = loop_idx / (m_loop * n_loop);
+        int64_t in_batch_idx = loop_idx % (m_loop * n_loop);
+        int64_t m_idx;
+        int64_t n_idx;
+
+        constexpr int N_COL = 16;
+        int tile_block_loop = (n_loop + N_COL - 1) / N_COL;
+        int tile_block_idx = in_batch_idx / (N_COL * m_loop);
+        int in_tile_block_idx = in_batch_idx % (N_COL * m_loop);
+        int n_col = N_COL;
+        if(tile_block_idx == tile_block_loop - 1) {
+            n_col = n_loop - N_COL * tile_block_idx;
+        }
+        m_idx = in_tile_block_idx / n_col;
+        n_idx = tile_block_idx * N_COL + in_tile_block_idx % n_col;
+        // m_idx = in_batch_idx / n_loop;
+        // n_idx = in_batch_idx % n_loop;
+
+        int64_t offset_c = batch_idx * ldc * N + m_idx * M0 + n_idx * N0 * ldc;
+        int64_t m_actual = (m_idx == (m_loop - 1)) ? (M - m_idx * M0) : M0;
+        int64_t n_actual = (n_idx == (n_loop - 1)) ? (N - n_idx * N0) : N0;
+        int64_t m_round = (m_actual + 15) / 16 * 16;
+        int64_t n_round = (n_actual + 15) / 16 * 16;
+
+        wait_flag(PIPE_MTE3, PIPE_MTE2, C_EVENT_ID);
+
+        // 读取C分块
+        if (get_subblockid() == 0) {
+            gm2ubuf_matrix(
+                ubufC, 
+                gm_C + offset_c,
+                N0 / 2 < n_actual ? N0 / 2 : n_actual,
+                m_actual,
+                ldc,
+                M0);
+        } else if (get_subblockid() == 1 && N0 / 2 < n_actual) {
+            gm2ubuf_matrix(
+                ubufC, 
+                gm_C + offset_c + get_subblockid() * ldc * N0 / 2,
+                n_actual - N0 / 2,
+                m_actual,
+                ldc,
+                M0);
+        }
+
+        set_flag(PIPE_MTE2, PIPE_V, C_EVENT_ID);
+        wait_flag(PIPE_MTE2, PIPE_V, C_EVENT_ID);
+
+        vmuls(ubufC, ubufC, beta, M0 * N0 / 2 / (C0_SIZE * 8), 1, 1, 8, 8);
+
+        pipe_barrier(PIPE_V);
+
+
+        wait_flag(PIPE_MTE3, PIPE_MTE2, AB_EVENT_ID);
+
+        wait_flag_dev(l0c_ping_flag);
+
+        // 读取AB的中间分块
+        copy_gm_to_ubuf(
+            ubufAB,
+            workspace + (get_block_idx() * 2 + l0c_ping_flag) * M0 * N0 + get_subblockid() * M0 * N0 / 2,
+            0,                                   // sid
+            1,                                   // nBurst
+            M0 * N0 / 2 / C0_SIZE,               // lenBurst
+            0,                                   // srcGap
+            0                                    // dstGap
+        );
+
+        set_flag(PIPE_MTE2, PIPE_V, AB_EVENT_ID);
+        wait_flag(PIPE_MTE2, PIPE_V, AB_EVENT_ID);
+
+        vmuls(ubufAB, ubufAB, alpha, M0 * N0 / 2 / (C0_SIZE * 8), 1, 1, 8, 8);
+
+        pipe_barrier(PIPE_V);
+
+        vadd(ubufD, ubufAB, ubufC, M0 * N0 / 2 / (C0_SIZE * 8), 1, 1, 1, 8, 8, 8);
+
+        set_flag(PIPE_MTE3, PIPE_MTE2, C_EVENT_ID);
+        set_flag(PIPE_MTE3, PIPE_MTE2, AB_EVENT_ID);
+
+        set_flag(PIPE_V, PIPE_MTE3, C_EVENT_ID);
+        wait_flag(PIPE_V, PIPE_MTE3, C_EVENT_ID);
+
+        if (get_subblockid() == 0) {
+            ubuf2gm_matrix(
+                gm_C + offset_c,
+                ubufD,
+                N0 / 2 < n_actual ? N0 / 2 : n_actual,
+                m_actual,
+                M0,
+                ldc
+            );
+        } else if (get_subblockid() == 1 && N0 / 2 < n_actual) {
+            ubuf2gm_matrix(
+                gm_C + offset_c + get_subblockid() * ldc * N0 / 2,
+                ubufD,
+                n_actual - N0 / 2,
+                m_actual,
+                M0,
+                ldc
+            );
+        }
+        l0c_ping_flag = 1 - l0c_ping_flag;
+    }
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID2);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
+
+    pipe_barrier(PIPE_ALL);
+    return;
+}
+
+#endif
+

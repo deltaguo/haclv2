@@ -1,0 +1,1052 @@
+#ifdef __CCE_KT_TEST__
+#define __aicore__
+#else
+#define __aicore__ [aicore]
+#endif
+// CAmodel 不需要头文件
+#ifndef CAMODEL
+
+#include "kernel_operator.h"
+
+#endif
+
+#include "ascblas_kernel_utils.h"
+
+using namespace fp16;
+
+
+
+/*
+整体流程描述：
+
+1. 查看A, B矩阵是否需要padding，需要padding则AIV进行padding,并且按照nN排布。AIC等待
+
+2. AIC执行矩阵乘法
+    (1) AIC 计算矩阵乘法时，L1，L0AB, L0C 上均有双缓存。
+        - L1 分成四份，A, B 双缓存一共需要四份空间（每份空间最大为128 * 256）
+        - L0AB 也双缓存，L0A 分为两份（每份空间为128 * 64）。L0B同理
+        - L0C 双缓存（每份空间为128 * 128),主要掩盖L0C -> GM的延迟
+        - 空间不够完全放下就循环计算
+    (2) CUBE执行的矩阵乘法为 B分块(N0, K0)和A分块(K0, M0) 相乘，原因是L0C -> GM的随机存储只支持行优先存取方式。
+        故：
+        我们将 C = A * B + C 转换为 C^T = B^T * A^T + C^T
+        将C^T按行优先存储，相当于将C按列优先存储
+
+3. 需要乘alpha加beta乘C，则AIC将输出数据存到AIV_AIC_workspace上。由AIV完毕乘alpha加beta乘C操作。
+    （1）和矩阵乘法同步时，计算完一个AB分块，马上进行乘alpha加beta乘C操作。该操作可被矩阵乘法所掩盖。
+*/
+
+
+
+/**
+ * @brief AIV函数：将列优先的nD矩阵,两列之间的距离由lda，改为lda_padding
+ * @param [in] __cbuf__ __fp16 *dst：GM 目的地址
+ * @param [in] __gm__ __fp16 *src: GM 源地址
+ * @param [in] int64_t M：在UB中矩阵的行数（不需要对齐）
+ * @param [in] int64_t N：在UB中矩阵的列数（不需要对齐）
+ * @param [in] int64_t lda：在GM中，原始矩阵两列之间的距离（不需要对齐）
+ * @param [in] int64_t lda_padding：在GM中距离变化后，矩阵两列之间的距离（不要求一定对齐，不过一般会变为512B的对齐）
+ */
+__aicore__ __inline__ void matrix_padding(
+    __gm__ __fp16 * __restrict__ dst, 
+    __gm__ __fp16 * __restrict__ src, 
+    int64_t M, 
+    int64_t N,
+    int64_t M0,
+    int64_t N0,
+    int64_t lda, 
+    int64_t lda_padding
+)
+{
+    constexpr int64_t SIZE_PER_REPEAT = 96*1024;
+    int32_t aic_id = get_block_idx(); // 物理核的id
+    int32_t aiv_id_per_block = get_subblockid(); // 同一group两个AIV的id（0-1） 
+    int32_t blocks_num = get_block_num(); // 申请物理核数
+    int aiv_id = aic_id * get_subblockdim() + aiv_id_per_block; // AIV的id
+    auto buf1 = reinterpret_cast<__ubuf__ __fp16*>((uintptr_t)0);
+    auto buf2 = reinterpret_cast<__ubuf__ __fp16*>((uintptr_t)SIZE_PER_REPEAT);
+    // int32_t N0 = 128;
+    const int data_num = SIZE_PER_REPEAT / sizeof(__fp16);
+    // 当M的长度超过UB最大空间的一半时，每次padding矩阵的一个行块。
+    if (M >= (data_num - NUM_ELE_PERBLOCK) / 2) {
+        const int M_block_num = (M + data_num - 1) / data_num;
+        const int M_remain = M % data_num;
+        const int loop = M_block_num * N;
+        int32_t flag = 1;
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+        for (int loop_idx = 0; loop_idx < loop; loop_idx++) {
+            if (loop_idx % (get_subblockdim() * blocks_num) != aiv_id) {
+                continue;
+            }
+            int32_t M_block_idx = loop_idx % M_block_num;
+            int32_t N_idx = loop_idx / M_block_num;
+            
+            int32_t data_actual = data_num;
+            if (M_block_idx == M_block_num - 1 && M_remain > 0) {
+                data_actual = M_remain;
+            }
+            auto buf = flag ? buf1 : buf2;
+            auto K_LOOP_EVENT_ID = flag ? EVENT_ID0 : EVENT_ID1;
+            wait_flag(PIPE_MTE3, PIPE_MTE2, K_LOOP_EVENT_ID);
+            auto in_ptr = src + N_idx * lda + M_block_idx * data_num;
+            copy_gm_to_ubuf(buf, in_ptr, 0, 1, (data_actual + NUM_ELE_PERBLOCK - 1) / NUM_ELE_PERBLOCK, 0, 0);
+            set_flag(PIPE_MTE2, PIPE_MTE3, K_LOOP_EVENT_ID);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, K_LOOP_EVENT_ID);
+            // 数据按照nN排布，n的宽度为128
+            auto out_ptr = dst + N_idx / N0 * lda_padding * N0 + M_block_idx * data_num * N0 + N_idx % N0 * M0;
+            copy_ubuf_to_gm(out_ptr, buf, 0, (data_actual + M0 - 1) / M0, M0 / NUM_ELE_PERBLOCK, 0, (M0 * N0 - M0) / NUM_ELE_PERBLOCK);
+            set_flag(PIPE_MTE3, PIPE_MTE2, K_LOOP_EVENT_ID);
+            flag = 1 - flag;
+        }
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    } else { // 当M的长度小于UB最大空间的一半时，每次padding矩阵的多行。
+        // const int M_round = ROUND(M, NUM_ELE_PERBLOCK);
+        const int M_round = (M + NUM_ELE_PERBLOCK - 1) / NUM_ELE_PERBLOCK * NUM_ELE_PERBLOCK;
+        const int UB_N0 = data_num / M_round;
+        const int N_loop = (N + UB_N0 - 1) / UB_N0;
+        const int N_remain = N % UB_N0;
+        const int loop = N_loop;
+        int32_t flag = 1;
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+        for (int loop_idx = 0; loop_idx < loop; loop_idx++) {
+            if (loop_idx % (get_subblockdim() * blocks_num) != aiv_id) {
+                continue;
+            }
+            int32_t N_idx = loop_idx;
+            int32_t N_actual = UB_N0;
+            if (N_idx == loop - 1 && N_remain > 0) {
+                N_actual = N_remain;
+            }
+            auto buf = flag ? buf1 : buf2;
+            auto K_LOOP_EVENT_ID = flag ? EVENT_ID0 : EVENT_ID1;
+            wait_flag(PIPE_MTE3, PIPE_MTE2, K_LOOP_EVENT_ID);
+            auto src_ptr = src + N_idx * UB_N0 * lda;
+            ascblas_matrix_gm2ubuf(
+                buf, 
+                src_ptr,
+                M,
+                N_actual,
+                lda,
+                M_round);
+            set_flag(PIPE_MTE2, PIPE_MTE3, K_LOOP_EVENT_ID);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, K_LOOP_EVENT_ID);
+            // auto dst_ptr = dst + N_idx * UB_N0 * lda_padding;
+            // ascblas_matrix_ubuf2gm(
+            //     dst_ptr,
+            //     buf,
+            //     M,
+            //     N_actual,
+            //     M_round,
+            //     lda_padding
+            // );
+            for (int N_tile_index = 0; N_tile_index < N_actual; N_tile_index++) {
+                int N_actual_index = N_idx * UB_N0 + N_tile_index;
+                int64_t N_actual_index_div_N0 = N_actual_index / N0;
+                int64_t N_actual_index_mod_N0 = N_actual_index % N0;
+                auto out_ptr = dst + N_actual_index_div_N0 * lda_padding * N0 + N_actual_index_mod_N0 * M0;
+                copy_ubuf_to_gm(out_ptr, buf + N_tile_index * M_round, 0, (M_round + M0 - 1) / M0, M0 / NUM_ELE_PERBLOCK, 0, (M0 * N0 - M0) / NUM_ELE_PERBLOCK);
+            }
+            set_flag(PIPE_MTE3, PIPE_MTE2, K_LOOP_EVENT_ID);
+            flag = 1 - flag;
+        }
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+
+    }
+    pipe_barrier(PIPE_ALL);
+}
+
+/**
+ * @brief AIC函数：计算C=AB，支持和AIV配合完成D = beta * C + alpha * AB
+ * @param [in] ascblasOperation_t transA：输入A的形状是(M, K)还是(K, M)。
+ * @param [in] ascblasOperation_t transB：输入B的形状是(K, N)还是(N, K)。
+ * @param [in] int64_t M: A和C的行数
+ * @param [in] int64_t N: B的列数
+ * @param [in] int64_t K: A的列数，B的行数
+ * @param [in] __gm__ __fp16 * __restrict__ gm_A：输入矩阵A的指针
+ * @param [in] int64_t lda：在GM中A矩阵两列之间的距离（不需要对齐）
+ * @param [in] __gm__ __fp16 * __restrict__ gm_B：输入矩阵B的指针
+ * @param [in] int64_t ldb：在GM中B矩阵两列之间的距离（不需要对齐）
+ * @param [in] __gm__ __fp16 * __restrict__ gm_C：输入矩阵C的指针
+ * @param [in] int64_t ldc：在GM中C矩阵两列之间的距离（不需要对齐）
+ * @param [in] int64_t batchSize：计算多少个矩阵乘法
+ * @param [in] int64_t M0：每个AIC计算的矩阵的分块大小
+ * @param [in] int64_t N0：每个AIC计算的矩阵的分块大小
+ * @param [in] int64_t K0：每个AIC计算的矩阵的分块大小
+ * @param [in] int64_t is_AIV_AIC_PIPE：是否和AIV同步。开启该选项会和AIV同步将数据写入到AIV_AIC_workspace，之后由AIV处理。
+ * @param [in] __gm__ __fp16 * __restrict__ AIV_AIC_workspace：AIV和AIC同步时需要的额外GM空间
+ */
+__aicore__ __inline__ void ascblasHmatmul(
+    ascblasOperation_t transA,
+    ascblasOperation_t transB,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    __gm__ __fp16 * __restrict__ gm_A,
+    int64_t lda,
+    __gm__ __fp16 * __restrict__ gm_B,
+    int64_t ldb,
+    __gm__ __fp16 * __restrict__ gm_C,
+    int64_t ldc,
+    int64_t batchSize,
+    int64_t M0,
+    int64_t N0,
+    int64_t K0,
+    int64_t is_AIV_AIC_PIPE,
+    __gm__ __fp16 * __restrict__ AIV_AIC_workspace
+)
+{
+    auto L1_base_a = reinterpret_cast<__cbuf__ __fp16 *>((uintptr_t)0);            // 128 KB 128*256*2/1024=64 double buffer
+    auto L1_base_b = reinterpret_cast<__cbuf__ __fp16 *>((uintptr_t)(128 * 1024)); // 128 KB 256*128
+
+    auto L0A_base = reinterpret_cast<__ca__ __fp16 *>((uintptr_t)0); //128*128*2/1024=32 double buffer
+    auto L0B_base = reinterpret_cast<__cb__ __fp16 *>((uintptr_t)0); //128*128*2/1024=32 double buffer
+    auto L0C_base = reinterpret_cast<__cc__ float *>((uintptr_t)0); //128*128*4/1024=64 double buffer
+
+    int64_t m_loop = (M + M0 - 1) / M0; // 在 M 方向分的核数
+    int64_t n_loop = (N + N0 - 1) / N0; // 在 N 方向分的核数
+    int64_t k_loop = (K + K0 - 1) / K0; // K 方向循环的次数
+    int64_t loop = batchSize * m_loop * n_loop; // 总的核数
+
+    int64_t loop_ping_flag = 1; // 控制loop循环的双循环
+    int64_t k_loop_ping_flag = 1; // 控制k_loop循环的双循环
+
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID0); // 同步L0C的使用
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID1); // 同步L0C的使用
+
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0); // 同步L1_buf_a的使用
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1); // 同步L1_buf_a的使用
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2); // 同步L1_buf_b的使用
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3); // 同步L1_buf_b的使用
+    
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0); // 同步L1 -> (L0A | L0B)
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1); // 同步L1 -> (L0A | L0B)
+
+    // 循环遍历每个分块
+    for (int64_t loop_idx = 0; loop_idx < loop; loop_idx++) {
+
+        // 该循环计算L1上B分块(N0, K0)和A分块(K0, M0)的矩阵乘法并加到L0C上
+
+        // 平均分配给物理核心，不是自己的任务就略过到下一项
+        if (loop_idx % get_block_num() != get_block_idx()) {
+            continue;
+        }
+
+        // 定义变量全部使用双缓冲
+        auto L0C_buf = loop_ping_flag ? L0C_base + L0C_PINGPONG_BUFFER_LEN : L0C_base;
+        auto LOOP_EVENT_ID = loop_ping_flag ? EVENT_ID0 : EVENT_ID1;
+
+        int64_t batch_idx = loop_idx / (m_loop * n_loop);
+        int64_t in_batch_idx = loop_idx % (m_loop * n_loop);
+        int64_t m_idx;
+        int64_t n_idx;
+
+        // 让分块的id按照zN的方式排列
+        constexpr int64_t N_COL = 16;
+        int64_t tile_block_loop = (n_loop + N_COL - 1) / N_COL; //行方向z的个数
+        int64_t tile_block_idx = in_batch_idx / (N_COL * m_loop);//在行方向第几个z
+        int64_t in_tile_block_idx = in_batch_idx % (N_COL * m_loop);//在行方向第几个z中的id
+        int64_t n_col = N_COL; //最后一个z的实际宽度
+        if(tile_block_idx == tile_block_loop - 1) {
+            n_col = n_loop - N_COL * tile_block_idx;
+        }
+        m_idx = in_tile_block_idx / n_col;
+        n_idx = tile_block_idx * N_COL + in_tile_block_idx % n_col;
+        // m_idx = in_batch_idx / n_loop;
+        // n_idx = in_batch_idx % n_loop;
+        
+        // 计算分块的偏移量
+        int64_t offset_a, offset_b;
+        int64_t offset_c = batch_idx * ldc * N + m_idx * M0 + n_idx * N0 * ldc;
+        // 计算分块的实际大小和向上16取整的大小
+        int64_t m_actual = (m_idx == (m_loop - 1)) ? (M - m_idx * M0) : M0;
+        int64_t n_actual = (n_idx == (n_loop - 1)) ? (N - n_idx * N0) : N0;
+        int64_t m_round = ROUND(m_actual, 16);
+        int64_t n_round = ROUND(n_actual, 16);
+
+        // 计算L0AB中k方向的最大能放多少个数
+        int64_t mn_max = m_round > n_round ? m_round : n_round;
+        int64_t L0AB_K0 = L0AB_PINGPONG_BUFFER_LEN / mn_max / 16 * 16;
+
+        for (int64_t k_idx = 0; k_idx < k_loop; k_idx++) {
+            // 计算分块的地址位置
+            // 按照nN读取
+            if(transA !=  ASCBLAS_OP_N) {
+                // offset_a = batch_idx * M * lda + k_idx * K0 + m_idx * M0 * lda;
+                offset_a = batch_idx * M * lda + k_idx * K0 * M0 + m_idx * M0 * lda;
+            } else {
+                // offset_a = batch_idx * lda * K + m_idx * M0 + k_idx * K0 * lda;
+                offset_a = batch_idx * lda * K + m_idx * M0 * K0 + k_idx * K0 * lda;
+            }
+
+            if(transB !=  ASCBLAS_OP_N) {
+                // offset_b = batch_idx * K * ldb + n_idx * N0 + k_idx * K0 * ldb;
+                offset_b = batch_idx * K * ldb + n_idx * N0 * K0 + k_idx * K0 * ldb;
+            } else {
+                // offset_b = batch_idx * ldb * N + k_idx * K0 + n_idx * N0 * ldb;
+                offset_b = batch_idx * ldb * N + k_idx * K0 * N0  + n_idx * N0 * ldb;
+            }
+
+            // 计算分块的实际大小和向上16取整的大小
+            int64_t k_actual = (k_idx == (k_loop - 1)) ? (K - k_idx * K0) : K0;
+            int64_t k_round = ROUND(k_actual, 16);
+            int64_t L0AB_k_loop = (k_actual + L0AB_K0 - 1) / L0AB_K0;
+
+            auto L1_buf_a = k_loop_ping_flag ? L1_base_a : L1_base_a + L1_PINGPONG_BUFFER_LEN;
+            auto L1_buf_b = k_loop_ping_flag ? L1_base_b : L1_base_b + L1_PINGPONG_BUFFER_LEN;
+            auto K_LOOP_EVENT_ID = k_loop_ping_flag ? EVENT_ID0 : EVENT_ID1;
+
+            // *** load matrix A to L1
+            wait_flag(PIPE_MTE1, PIPE_MTE2, K_LOOP_EVENT_ID); // 控制 L1_buf_a 的使用
+            if (transA !=  ASCBLAS_OP_N) {
+                ascblas_matrix_gm2cbuf_ND2nZ(L1_buf_a, gm_A + offset_a, K0, M0, k_actual, m_actual, K0);
+                            } else {
+                ascblas_matrix_gm2cbuf_ND2nN(L1_buf_a, gm_A + offset_a, M0, K0, m_actual, k_actual, M0);
+            }
+            set_flag(PIPE_MTE2, PIPE_MTE1, K_LOOP_EVENT_ID); // L1_buf_a 读取完毕，可以开始进行L1 -> L0B的拷贝了
+            
+
+            // *** load matrix B to L1
+            wait_flag(PIPE_MTE1, PIPE_MTE2, K_LOOP_EVENT_ID + 2); // 控制 L1_buf_b 的使用
+            if (transB !=  ASCBLAS_OP_N) {
+                ascblas_matrix_gm2cbuf_ND2nN(L1_buf_b, gm_B + offset_b, N0, K0, n_actual, k_actual, N0);
+            } else {
+                ascblas_matrix_gm2cbuf_ND2nZ(L1_buf_b, gm_B + offset_b, K0, N0, k_actual, n_actual, K0);
+                            }
+
+            set_flag(PIPE_MTE2, PIPE_MTE1, K_LOOP_EVENT_ID + 2); // L1_buf_b 读取完毕，可以开始进行L1 -> L0A的拷贝了
+
+            for (int L0AB_k_idx = 0; L0AB_k_idx < L0AB_k_loop; L0AB_k_idx++) {
+                // 该循环计算L0AB上B分块(N0, L0AB_K0)和A分块(L0AB_K0, M0)的矩阵乘法并加到L0C上
+                int64_t L0AB_k_round = (L0AB_k_idx < L0AB_k_loop - 1) ? L0AB_K0 : k_round - L0AB_k_idx * L0AB_K0;
+                int64_t L0AB_k_actual = (L0AB_k_idx < L0AB_k_loop - 1) ? L0AB_K0 : k_actual - L0AB_k_idx * L0AB_K0;
+            
+                auto mte1_mad_ping_flag = 1 - L0AB_k_idx % 2;
+                auto mte1_mad_event_id = mte1_mad_ping_flag ? EVENT_ID0 : EVENT_ID1;
+                auto L0A_buf = L0A_base + (L0AB_k_idx % 2) * L0AB_PINGPONG_BUFFER_LEN;
+                auto L0B_buf = L0B_base + (L0AB_k_idx % 2) * L0AB_PINGPONG_BUFFER_LEN;
+            
+                // *** load matrix A from L1 to L0B
+                if (L0AB_k_idx == 0) {
+                    wait_flag(PIPE_MTE2, PIPE_MTE1, K_LOOP_EVENT_ID); // 等待gm -> L1结束，在读取到L0B上
+                }
+                wait_flag(PIPE_M, PIPE_MTE1, mte1_mad_event_id); // 当CUBE计算结束，才能拷贝到L0AB上
+                if (transA !=  ASCBLAS_OP_N) {
+                    auto L1_src_a = L1_buf_a + L0AB_k_idx * L0AB_K0 * M0;
+                    for (int i = 0; i < L0AB_k_round / CUBE_K0; i++) {
+                        load_cbuf_to_cb(
+                            L0B_buf + i * m_round * CUBE_K0,
+                            L1_src_a + i * CUBE_K0 * M0,
+                            0,
+                            m_round / CUBE_M0,
+                            1,
+                            0,
+                            0,
+                            false,
+                            inc
+                        );
+                    }
+                } else {
+                    auto L1_src_a = L1_buf_a + L0AB_k_idx * L0AB_K0 * M0;
+                    for (int i = 0; i < m_round / CUBE_M0; i++) {
+                        // load_cbuf_to_cb_transpose(
+                        //     L0B_buf + i * CUBE_MATRIX_SIZE,
+                        //     L1_src_a + i * CUBE_MATRIX_SIZE,
+                        //     0,
+                        //     L0AB_k_round / (CUBE_K0),
+                        //     M0 / CUBE_M0,
+                        //     m_round / CUBE_M0 - 1,
+                        //     inc,
+                        //     m_round / CUBE_M0 - 1
+                        // );
+                        load_cbuf_to_cb(
+                            L0B_buf + i * CUBE_MATRIX_SIZE,
+                            L1_src_a + i * CUBE_MATRIX_SIZE,
+                            0,
+                            L0AB_k_round / (CUBE_K0),
+                            M0 / CUBE_M0,
+                            m_round / CUBE_M0 - 1,
+                            0,
+                            true,
+                            inc
+                        );
+                    }
+                }
+
+                if (L0AB_k_idx == L0AB_k_loop - 1) { // L1上的数据已经读取完毕，可以进行下一次 GM -> L1 了
+                    set_flag(PIPE_MTE1, PIPE_MTE2, K_LOOP_EVENT_ID);
+                }
+
+                // *** load matrix B from L1 to L0B
+                if (L0AB_k_idx == 0) {
+                    wait_flag(PIPE_MTE2, PIPE_MTE1, K_LOOP_EVENT_ID + 2); // 等待gm -> L1结束，在读取到L0B上
+                }
+                if (transB !=  ASCBLAS_OP_N) {
+                    auto L1_src_b = L1_buf_b + L0AB_k_idx * L0AB_K0 * N0; // 当CUBE计算结束，才能拷贝到L0AB上
+                    for (int i = 0; i < n_round / CUBE_N0; i++) {
+                        // load_cbuf_to_ca_transpose(
+                        //     L0A_buf + i * L0AB_k_round * CUBE_N0,
+                        //     L1_src_b + i * CUBE_MATRIX_SIZE,
+                        //     0,
+                        //     L0AB_k_round / (CUBE_K0),
+                        //     N0 / CUBE_N0,
+                        //     1,
+                        //     inc,
+                        //     0
+                        // );
+                        load_cbuf_to_ca(
+                            L0A_buf + i * L0AB_k_round * CUBE_N0,
+                            L1_src_b + i * CUBE_MATRIX_SIZE,
+                            0,
+                            L0AB_k_round / CUBE_K0,
+                            N0 / CUBE_N0,
+                            0,
+                            0,
+                            true,
+                            inc
+                        );
+                    }
+                } else {
+                    auto L1_src_b = L1_buf_b + L0AB_k_idx * L0AB_K0 * N0;
+                    for (int i = 0; i < n_round / CUBE_N0; i++) {
+                        load_cbuf_to_ca(
+                            L0A_buf + i * L0AB_k_round * CUBE_N0,
+                            L1_src_b + i * CUBE_MATRIX_SIZE,
+                            0,
+                            L0AB_k_round / CUBE_K0,
+                            N0 / CUBE_N0,
+                            0,
+                            0,
+                            false,
+                            inc
+                        );
+                    }
+                }
+                if (L0AB_k_idx == L0AB_k_loop - 1) { // L1上的数据已经读取完毕，可以进行下一次 GM -> L1 了
+                    set_flag(PIPE_MTE1, PIPE_MTE2, K_LOOP_EVENT_ID + 2);
+                }
+
+                set_flag(PIPE_MTE1, PIPE_M, mte1_mad_event_id);
+                wait_flag(PIPE_MTE1, PIPE_M, mte1_mad_event_id);
+
+                bool init_c = (k_idx == 0 && L0AB_k_idx == 0); // 第一次循环直接赋值即可
+                if (init_c) { // 同步L0C的写入和CUBE的计算
+                    wait_flag(PIPE_FIX, PIPE_M, LOOP_EVENT_ID);
+                }
+                mad(L0C_buf,
+                    L0A_buf,
+                    L0B_buf,
+                    n_round,
+                    L0AB_k_actual,
+                    m_round,
+                    0,
+                    1,
+                    0,
+                    init_c
+                );
+                
+                pipe_barrier(PIPE_M);
+                set_flag(PIPE_M, PIPE_MTE1, mte1_mad_event_id); // CUBE计算完毕，可以进行 L1 -> L0AB 的拷贝了
+            }
+            k_loop_ping_flag = 1 - k_loop_ping_flag; // 更换标记做双缓存
+        }
+
+        // CUBE计算完毕，存回到GM
+        set_flag(PIPE_M, PIPE_FIX, LOOP_EVENT_ID);
+        wait_flag(PIPE_M, PIPE_FIX, LOOP_EVENT_ID);
+
+        // copy from L0C to gm
+        // 如果需要乘alpha加C拷贝到 AIV_AIC_workspace 上便于AIV获取
+        if (is_AIV_AIC_PIPE) {
+            wait_flag_dev(loop_ping_flag + 2); // 等待AIV上 AIV_AIC_workspace 使用完毕
+            copy_matrix_cc_to_gm(
+                AIV_AIC_workspace + (get_block_idx() * 2 + loop_ping_flag) * M0 * N0,
+                L0C_buf,
+                0,
+                m_actual,
+                n_actual,
+                M0,
+                n_round,
+                0,
+                F322F16,
+                0,
+                false,
+                true
+            );
+            ffts_cross_core_sync(PIPE_FIX, GET_FFST_MSG(2, loop_ping_flag)); // AIC已经将AB写入到AIV_AIC_workspace中，AIV可以开始读取
+        } else {
+            // 不需要乘alpha加C直接写入到GM
+            copy_matrix_cc_to_gm(
+                gm_C + offset_c,
+                L0C_buf,
+                0,
+                m_actual,
+                n_actual,  
+                ldc,   
+                n_round,
+                0,
+                F322F16,
+                0,
+                false,
+                true
+            );
+        }
+
+        loop_ping_flag = 1 - loop_ping_flag;
+
+        set_flag(PIPE_FIX, PIPE_M, LOOP_EVENT_ID);
+    }
+    if (is_AIV_AIC_PIPE) {
+        wait_flag_dev(0 + 2); // 处理最后一次AIV的set同步
+        wait_flag_dev(1 + 2); // 处理最后一次AIV的set同步
+    }
+
+    // 匹配最后一次的set
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+}
+
+/**
+ * @brief AIV函数：配合完成D = beta * C + alpha * AB, AB存放在workspace中。最终结果写入到gm_C
+ * @param [in] ascblasOperation_t transA：输入A的形状是(M, K)还是(K, M)。
+ * @param [in] ascblasOperation_t transB：输入B的形状是(K, N)还是(N, K)。
+ * @param [in] int64_t M: A和C的行数
+ * @param [in] int64_t N: B的列数
+ * @param [in] int64_t K: A的列数，B的行数
+ * @param [in] __gm__ __fp16 * __restrict__ gm_A：输入矩阵A的指针
+ * @param [in] int64_t lda：在GM中A矩阵两列之间的距离（不需要对齐）
+ * @param [in] __gm__ __fp16 * __restrict__ gm_B：输入矩阵B的指针
+ * @param [in] int64_t ldb：在GM中B矩阵两列之间的距离（不需要对齐）
+ * @param [in] __gm__ __fp16 * __restrict__ gm_C：输入矩阵C的指针
+ * @param [in] int64_t ldc：在GM中C矩阵两列之间的距离（不需要对齐）
+ * @param [in] int64_t batchSize：计算多少个矩阵乘法
+ * @param [in] int64_t M0：每个AIC计算的矩阵的分块大小
+ * @param [in] int64_t N0：每个AIC计算的矩阵的分块大小
+ * @param [in] int64_t K0：每个AIC计算的矩阵的分块大小
+ * @param [in] int64_t is_AIV_AIC_PIPE：是否和AIV同步。开启该选项会和AIV同步将数据写入到AIV_AIC_workspace，之后由AIV处理。
+ * @param [in] __gm__ __fp16 * __restrict__ AIV_AIC_workspace：AIV和AIC同步时需要的额外GM空间
+ */
+__aicore__ __inline__ void add_beta_dot_C_and_alpha_dot_AB(
+    ascblasOperation_t transA,
+    ascblasOperation_t transB,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    __fp16 alpha,
+    __gm__ __fp16 * __restrict__ gm_A,
+    int64_t lda,
+    __gm__ __fp16 * __restrict__ gm_B,
+    int64_t ldb,
+    __fp16 beta,
+    __gm__ __fp16 * __restrict__ gm_C,
+    int64_t ldc,
+    int64_t batchSize,
+    int64_t M0,
+    int64_t N0,
+    int64_t K0,
+    __gm__ __fp16 * __restrict__ AIV_AIC_workspace
+) {
+    auto ubufC1 = reinterpret_cast<__ubuf__ __fp16 *>((uintptr_t)0);           // 32 KB
+    auto ubufC2 = reinterpret_cast<__ubuf__ __fp16 *>((uintptr_t)(32 * 1024)); // 32 KB
+    auto ubufAB1 = reinterpret_cast<__ubuf__ __fp16 *>((uintptr_t)(64 * 1024)); // 32 KB
+    auto ubufAB2 = reinterpret_cast<__ubuf__ __fp16 *>((uintptr_t)(96 * 1024)); // 32 KB
+    auto ubufD1 = reinterpret_cast<__ubuf__ __fp16 *>((uintptr_t)(128 * 1024)); // 32 KB
+    auto ubufD2 = reinterpret_cast<__ubuf__ __fp16 *>((uintptr_t)(160 * 1024)); // 32 KB
+
+    int64_t m_loop = (M + M0 - 1) / M0; // 在 M 方向分的核数
+    int64_t n_loop = (N + N0 - 1) / N0; // 在 N 方向分的核数
+    int64_t k_loop = (K + K0 - 1) / K0; // K 方向循环的次数
+    int64_t loop = batchSize * m_loop * n_loop; // 总的核数
+
+    int64_t loop_ping_flag = 1;
+    int64_t k_loop_ping_flag = 1;
+
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0); // 同步ubufC的使用
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1); // 同步ubufC的使用
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID2); // 同步ubufAB的使用 
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3); // 同步ubufAB的使用
+
+
+    ffts_cross_core_sync(PIPE_MTE2, GET_FFST_MSG(2, 0 + 2)); // 同步 AIV_AIC_workspace 的使用
+    ffts_cross_core_sync(PIPE_MTE2, GET_FFST_MSG(2, 1 + 2)); // 同步 AIV_AIC_workspace 的使用
+
+    // 循环遍历每个分块
+    for (int64_t loop_idx = 0; loop_idx < loop; loop_idx++) {
+        // 平均分配给物理核心，不是自己的任务就略过到下一项
+        if (loop_idx % get_block_num() != get_block_idx()) {
+            continue;
+        }
+
+        // 定义变量全部使用双缓冲
+        auto ubufC = loop_ping_flag ? ubufC1 : ubufC2;
+        auto ubufAB = loop_ping_flag ? ubufAB1 : ubufAB2;
+        auto ubufD = loop_ping_flag ? ubufD1 : ubufD2;
+        auto C_EVENT_ID = loop_ping_flag ? EVENT_ID0 : EVENT_ID1;
+        auto AB_EVENT_ID = loop_ping_flag ? EVENT_ID2 : EVENT_ID3;
+
+        int64_t batch_idx = loop_idx / (m_loop * n_loop);
+        int64_t in_batch_idx = loop_idx % (m_loop * n_loop);
+        int64_t m_idx;
+        int64_t n_idx;
+
+        // 让分块的id按照zZ的方式排列
+        constexpr int N_COL = 16;
+        int tile_block_loop = (n_loop + N_COL - 1) / N_COL;
+        int tile_block_idx = in_batch_idx / (N_COL * m_loop);
+        int in_tile_block_idx = in_batch_idx % (N_COL * m_loop);
+        int n_col = N_COL;
+        if(tile_block_idx == tile_block_loop - 1) {
+            n_col = n_loop - N_COL * tile_block_idx;
+        }
+        m_idx = in_tile_block_idx / n_col;
+        n_idx = tile_block_idx * N_COL + in_tile_block_idx % n_col;
+        // m_idx = in_batch_idx / n_loop;
+        // n_idx = in_batch_idx % n_loop;
+        
+        // 计算分块的偏移量
+        int64_t offset_c = batch_idx * ldc * N + m_idx * M0 + n_idx * N0 * ldc;
+        // 计算分块的实际大小和向上16取整的大小
+        int64_t m_actual = (m_idx == (m_loop - 1)) ? (M - m_idx * M0) : M0;
+        int64_t n_actual = (n_idx == (n_loop - 1)) ? (N - n_idx * N0) : N0;
+        int64_t m_round = ROUND(m_actual, 16);
+        int64_t n_round = ROUND(n_actual, 16);
+
+        wait_flag(PIPE_MTE3, PIPE_MTE2, C_EVENT_ID); // 等待上次循环的ubufC用完后才能开始使用
+
+        // 读取C分块 gm -> ub 同一 group 的 AIV 平均读取AIC写入一半的数据
+        if (get_subblockid() == 0) {
+            ascblas_matrix_gm2ubuf(
+                ubufC, 
+                gm_C + offset_c,
+                m_actual,
+                N0 / 2 < n_actual ? N0 / 2 : n_actual,
+                ldc,
+                M0);
+        } else if (get_subblockid() == 1 && N0 / 2 < n_actual) {
+            ascblas_matrix_gm2ubuf(
+                ubufC, 
+                gm_C + offset_c + get_subblockid() * ldc * N0 / 2,
+                m_actual,
+                n_actual - N0 / 2,
+                ldc,
+                M0);
+        }
+
+        // 数据读取到UB后才能开始vector计算
+        set_flag(PIPE_MTE2, PIPE_V, C_EVENT_ID);
+        wait_flag(PIPE_MTE2, PIPE_V, C_EVENT_ID);
+
+        // ubufC * beta
+        vmuls(ubufC, ubufC, beta, M0 * N0 / 2 / (NUM_ELE_PERBLOCK * 8), 1, 1, 8, 8);
+
+        // 如果两次vector操作，前后数据有依赖，请加 pipe_barrier(PIPE_V);
+        pipe_barrier(PIPE_V);
+
+
+        wait_flag(PIPE_MTE3, PIPE_MTE2, AB_EVENT_ID); // 等待上次循环的ubufAB用完后才能开始使用
+
+        wait_flag_dev(loop_ping_flag); // 等待AIC已经将矩阵存到 AIV_AIC_workspace 再开始读取
+
+        // 读取AB的中间分块
+        copy_gm_to_ubuf(
+            ubufAB,
+            AIV_AIC_workspace + (get_block_idx() * 2 + loop_ping_flag) * M0 * N0 + get_subblockid() * M0 * N0 / 2,
+            0,                                   // sid
+            1,                                   // nBurst
+            M0 * N0 / 2 / NUM_ELE_PERBLOCK,               // lenBurst
+            0,                                   // srcGap
+            0                                    // dstGap
+        );
+
+        ffts_cross_core_sync(PIPE_MTE2, GET_FFST_MSG(2, loop_ping_flag + 2)); // 报告 AIV_AIC_workspace 已经使用完毕
+
+        // 数据读取到UB后才能开始vector计算
+        set_flag(PIPE_MTE2, PIPE_V, AB_EVENT_ID);
+        wait_flag(PIPE_MTE2, PIPE_V, AB_EVENT_ID);
+
+        // ubufAB * alpha
+        vmuls(ubufAB, ubufAB, alpha, M0 * N0 / 2 / (NUM_ELE_PERBLOCK * 8), 1, 1, 8, 8);
+
+        pipe_barrier(PIPE_V);
+
+        // D = beta * C + alpha * AB
+        vadd(ubufD, ubufAB, ubufC, M0 * N0 / 2 / (NUM_ELE_PERBLOCK * 8), 1, 1, 1, 8, 8, 8);
+
+        set_flag(PIPE_MTE3, PIPE_MTE2, C_EVENT_ID); // ubufC 使用完毕
+        set_flag(PIPE_MTE3, PIPE_MTE2, AB_EVENT_ID);// ubufAB 使用完毕
+
+        // 等待vector 计算完毕再存回到GM中
+        set_flag(PIPE_V, PIPE_MTE3, C_EVENT_ID);
+        wait_flag(PIPE_V, PIPE_MTE3, C_EVENT_ID);
+
+        // ubufD存回到GM中
+        if (get_subblockid() == 0) {
+            ascblas_matrix_ubuf2gm(
+                gm_C + offset_c,
+                ubufD,
+                m_actual,
+                N0 / 2 < n_actual ? N0 / 2 : n_actual,
+                M0,
+                ldc
+            );
+        } else if (get_subblockid() == 1 && N0 / 2 < n_actual) {
+            ascblas_matrix_ubuf2gm(
+                gm_C + offset_c + get_subblockid() * ldc * N0 / 2,
+                ubufD,
+                m_actual,
+                n_actual - N0 / 2,
+                M0,
+                ldc
+            );
+        }
+
+        loop_ping_flag = 1 - loop_ping_flag; // 更换flag让下一次循环使用另外一片空间
+    }
+    
+    // 最后一次循环的set 需要wait来接收
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID2);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
+}
+
+#if __DAV_C220_CUBE__
+
+// CAmodel 需要将参数写入到tiling_para_gm中
+// CAmodel 指针编写顺序：输入数据指针，输出数据指针，tiling指针
+/**
+ * @brief AIC函数：计算C=AB，和AIV配合完成D = beta * C + alpha * AB
+ * @param [in] ascblasOperation_t transA：输入A的形状是(M, K)还是(K, M)。
+ * @param [in] ascblasOperation_t transB：输入B的形状是(K, N)还是(N, K)。
+ * @param [in] int64_t M: A和C的行数
+ * @param [in] int64_t N: B的列数
+ * @param [in] int64_t K: A的列数，B的行数
+ * @param [in] __fp16 alpha
+ * @param [in] __gm__ __fp16 * __restrict__ gm_A_nopadding：输入矩阵A的指针
+ * @param [in] int64_t lda：在GM中A矩阵两列之间的距离（不需要对齐）
+ * @param [in] __gm__ __fp16 * __restrict__ gm_B_nopadding：输入矩阵B的指针
+ * @param [in] int64_t ldb：在GM中B矩阵两列之间的距离（不需要对齐）
+ * @param [in] __gm__ __fp16 * __restrict__ gm_C_nopadding：输入矩阵C的指针
+ * @param [in] int64_t ldc：在GM中C矩阵两列之间的距离（不需要对齐）
+ * @param [in] int64_t batchSize：计算多少个矩阵乘法
+ * @param [in] int64_t M0：每个AIC计算的矩阵的分块大小
+ * @param [in] int64_t N0：每个AIC计算的矩阵的分块大小
+ * @param [in] int64_t K0：每个AIC计算的矩阵的分块大小
+ * @param [in] __gm__ __fp16 * __restrict__ AIV_AIC_workspace：AIV和AIC同步时需要的额外GM空间。不需要同步，则指针为空
+ * @param [in] __gm__ uint8_t * __restrict__ ffts_addr：AIV和AIC硬件同步时同步变量的存放空间
+ * @param [in] __gm__ __fp16 * __restrict__ gm_A_padding：padding后输入矩阵A的指针
+ * @param [in] int64_t lda_padding：padding后，在GM中A矩阵两列之间的距离（不需要对齐）
+ * @param [in] __gm__ __fp16 * __restrict__ gm_B_padding：padding后输入矩阵B的指针
+ * @param [in] int64_t ldb_padding：padding后，在GM中A矩阵两列之间的距离（不需要对齐）
+ * @param [in] int64_t is_lda_padding：是否A需要padding
+ * @param [in] int64_t is_ldb_padding：是否B需要padding
+ * @param [in] int64_t is_dot_alpha_add_beta_C：是否需要乘alpha加beta 乘 C
+ */
+#ifdef CAMODEL
+extern "C" __global__ __aicore__ void ascblasHgemm_kernel_mix_aic(
+    __gm__ uint8_t * __restrict__ ffts_addr,
+    __gm__ __fp16 * __restrict__ gm_A_nopadding,
+    __gm__ __fp16 * __restrict__ gm_B_nopadding,
+    __gm__ __fp16 * __restrict__ AIV_AIC_workspace,
+    __gm__ __fp16 * __restrict__ gm_A_padding,
+    __gm__ __fp16 * __restrict__ gm_B_padding,
+    __gm__ __fp16 * __restrict__ gm_C,
+    __gm__ uint32_t * __restrict__ tiling_para_gm
+)
+#else
+extern "C" __global__ __aicore__ void ascblasHgemm_kernel_mix_aic(
+    ascblasOperation_t transA,
+    ascblasOperation_t transB,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    __fp16 alpha,
+    __gm__ __fp16 * __restrict__ gm_A_nopadding,
+    int64_t lda_nopadding,
+    __gm__ __fp16 * __restrict__ gm_B_nopadding,
+    int64_t ldb_nopadding,
+    __fp16 beta,
+    __gm__ __fp16 * __restrict__ gm_C,
+    int64_t ldc,
+    int64_t batchSize,
+    int64_t M0,
+    int64_t N0,
+    int64_t K0,
+    __gm__ __fp16 * __restrict__ AIV_AIC_workspace,
+    __gm__ uint8_t * __restrict__ ffts_addr,
+    __gm__ __fp16 * __restrict__ gm_A_padding,
+    int64_t lda_padding,
+    __gm__ __fp16 * __restrict__ gm_B_padding,
+    int64_t ldb_padding,
+    int64_t is_lda_padding,
+    int64_t is_ldb_padding,
+    int64_t is_dot_alpha_add_beta_C
+)
+#endif
+{
+    // 初始设置
+    set_ffts_base_addr((uint64_t)ffts_addr);
+    set_padding(0);
+    set_atomic_none();
+    set_nd_para(0x1);
+
+// CAmodel 从tiling_para_gm解析出参数
+#ifdef CAMODEL
+    // get tiling args
+    auto tiling_para = reinterpret_cast<__gm__ int32_t *>(tiling_para_gm);
+    int64_t batchSize = tiling_para[0];
+    ascblasOperation_t transA = tiling_para[1] == 0 ? ASCBLAS_OP_N : ASCBLAS_OP_T;
+    ascblasOperation_t transB = tiling_para[2] == 0 ? ASCBLAS_OP_N : ASCBLAS_OP_T;
+    int64_t M = tiling_para[3];
+    int64_t N = tiling_para[4];
+    int64_t K = tiling_para[5];
+    int64_t lda_nopadding = tiling_para[6];
+    int64_t ldb_nopadding = tiling_para[7];
+    int64_t ldc = tiling_para[8];
+    int64_t M0 = tiling_para[9];
+    int64_t N0 = tiling_para[10];
+    int64_t K0 = tiling_para[11];
+    __fp16 alpha = ((__gm__ int32_t *)tiling_para)[12];
+    __fp16 beta = ((__gm__ int32_t *)tiling_para)[13];
+    int64_t lda_padding = tiling_para[14];
+    int64_t ldb_padding = tiling_para[15];
+    int64_t is_lda_padding = tiling_para[16];
+    int64_t is_ldb_padding = tiling_para[17];
+    int64_t is_dot_alpha_add_beta_C =  tiling_para[18];
+#endif
+
+    __gm__ __fp16 * __restrict__ gm_A = nullptr;
+    __gm__ __fp16 * __restrict__ gm_B = nullptr;
+    int64_t lda;
+    int64_t ldb;
+    // 如果需要padding，则gm_A指向新的地址。
+    if (!is_lda_padding) {
+        gm_A = gm_A_nopadding;
+        lda = lda_nopadding;
+    } else {
+        wait_flag_dev(1); // matrix_padding由AIV完成故需要等待
+        gm_A = gm_A_padding;
+        lda = lda_padding;
+    }
+    // 如果需要padding，则gm_B指向新的地址。
+    if (!is_ldb_padding) {
+        gm_B = gm_B_nopadding;
+        ldb = ldb_nopadding;
+    } else {
+        wait_flag_dev(2); // matrix_padding由AIV完成故需要等待
+        gm_B = gm_B_padding;
+        ldb = ldb_padding;
+    }
+
+    // 计算C=AB
+    ascblasHmatmul(
+        transA, 
+        transB,
+        M,
+        N,
+        K,
+        gm_A,
+        lda,
+        gm_B,
+        ldb,
+        gm_C,
+        ldc,
+        batchSize,
+        M0,
+        N0,
+        K0,
+        is_dot_alpha_add_beta_C,
+        AIV_AIC_workspace
+    );
+
+    pipe_barrier(PIPE_ALL);
+}
+
+#endif
+
+#if __DAV_C220_VEC__
+
+/**
+ * @brief AIV函数：计算C=AB，和AIC配合完成D = beta * C + alpha * AB
+ * @param [in] ascblasOperation_t transA：输入A的形状是(M, K)还是(K, M)。
+ * @param [in] ascblasOperation_t transB：输入B的形状是(K, N)还是(N, K)。
+ * @param [in] int64_t M: A和C的行数
+ * @param [in] int64_t N: B的列数
+ * @param [in] int64_t K: A的列数，B的行数
+ * @param [in] __fp16 alpha
+ * @param [in] __gm__ __fp16 * __restrict__ gm_A_nopadding：输入矩阵A的指针
+ * @param [in] int64_t lda：在GM中A矩阵两列之间的距离（不需要对齐）
+ * @param [in] __gm__ __fp16 * __restrict__ gm_B_nopadding：输入矩阵B的指针
+ * @param [in] int64_t ldb：在GM中B矩阵两列之间的距离（不需要对齐）
+ * @param [in] __gm__ __fp16 * __restrict__ gm_C_nopadding：输入矩阵C的指针
+ * @param [in] int64_t ldc：在GM中C矩阵两列之间的距离（不需要对齐）
+ * @param [in] int64_t batchSize：计算多少个矩阵乘法
+ * @param [in] int64_t M0：每个AIC计算的矩阵的分块大小
+ * @param [in] int64_t N0：每个AIC计算的矩阵的分块大小
+ * @param [in] int64_t K0：每个AIC计算的矩阵的分块大小
+ * @param [in] __gm__ __fp16 * __restrict__ AIV_AIC_workspace：AIV和AIC同步时需要的额外GM空间。不需要同步，则指针为空
+ * @param [in] __gm__ uint8_t * __restrict__ ffts_addr：AIV和AIC硬件同步时同步变量的存放空间
+ * @param [in] __gm__ __fp16 * __restrict__ gm_A_padding：padding后输入矩阵A的指针
+ * @param [in] int64_t lda_padding：padding后，在GM中A矩阵两列之间的距离（不需要对齐）
+ * @param [in] __gm__ __fp16 * __restrict__ gm_B_padding：padding后输入矩阵B的指针
+ * @param [in] int64_t ldb_padding：padding后，在GM中A矩阵两列之间的距离（不需要对齐）
+ * @param [in] int64_t is_lda_padding：是否A需要padding
+ * @param [in] int64_t is_ldb_padding：是否B需要padding
+ * @param [in] int64_t is_dot_alpha_add_beta_C：是否需要乘alpha加beta 乘 C
+ */
+// CAmodel 指针编写顺序：输入数据指针，输出数据指针，tiling指针
+#ifdef CAMODEL
+extern "C" __global__ __aicore__ void ascblasHgemm_kernel_mix_aiv(
+    __gm__ uint8_t * __restrict__ ffts_addr,
+    __gm__ __fp16 * __restrict__ gm_A_nopadding,
+    __gm__ __fp16 * __restrict__ gm_B_nopadding,
+    __gm__ __fp16 * __restrict__ AIV_AIC_workspace,
+    __gm__ __fp16 * __restrict__ gm_A_padding,
+    __gm__ __fp16 * __restrict__ gm_B_padding,
+    __gm__ __fp16 * __restrict__ gm_C,
+    __gm__ uint32_t * __restrict__ tiling_para_gm
+)
+#else
+extern "C" __global__ __aicore__ void ascblasHgemm_kernel_mix_aiv(
+    ascblasOperation_t transA,
+    ascblasOperation_t transB,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    __fp16 alpha,
+    __gm__ __fp16 * __restrict__ gm_A_nopadding,
+    int64_t lda_nopadding,
+    __gm__ __fp16 * __restrict__ gm_B_nopadding,
+    int64_t ldb_nopadding,
+    __fp16 beta,
+    __gm__ __fp16 * __restrict__ gm_C,
+    int64_t ldc,
+    int64_t batchSize,
+    int64_t M0,
+    int64_t N0,
+    int64_t K0,
+    __gm__ __fp16 * __restrict__ AIV_AIC_workspace,
+    __gm__ uint8_t * __restrict__ ffts_addr,
+    __gm__ __fp16 * __restrict__ gm_A_padding,
+    int64_t lda_padding,
+    __gm__ __fp16 * __restrict__ gm_B_padding,
+    int64_t ldb_padding,
+    int64_t is_lda_padding,
+    int64_t is_ldb_padding,
+    int64_t is_dot_alpha_add_beta_C
+    )
+#endif
+{
+    // 初始设置
+    set_atomic_none();
+    set_mask_norm();
+    set_ffts_base_addr((uint64_t)ffts_addr);
+    set_vector_mask((uint64_t)-1, (uint64_t)-1);
+#ifdef CAMODEL
+    // get tiling args
+    auto tiling_para = reinterpret_cast<__gm__ int32_t *>(tiling_para_gm);
+    int64_t batchSize = tiling_para[0];
+    ascblasOperation_t transA = tiling_para[1] == 0 ? ASCBLAS_OP_N : ASCBLAS_OP_T;
+    ascblasOperation_t transB = tiling_para[2] == 0 ? ASCBLAS_OP_N : ASCBLAS_OP_T;
+    int64_t M = tiling_para[3];
+    int64_t N = tiling_para[4];
+    int64_t K = tiling_para[5];
+    int64_t lda_nopadding = tiling_para[6];
+    int64_t ldb_nopadding = tiling_para[7];
+    int64_t ldc = tiling_para[8];
+    int64_t M0 = tiling_para[9];
+    int64_t N0 = tiling_para[10];
+    int64_t K0 = tiling_para[11];
+    __fp16 alpha = ((__gm__ int32_t *)tiling_para)[12];
+    __fp16 beta = ((__gm__ int32_t *)tiling_para)[13];
+    int64_t lda_padding = tiling_para[14];
+    int64_t ldb_padding = tiling_para[15];
+    int64_t is_lda_padding = tiling_para[16];
+    int64_t is_ldb_padding = tiling_para[17];
+    int64_t is_dot_alpha_add_beta_C =  tiling_para[18];
+#endif
+
+    __gm__ __fp16 * __restrict__ gm_A = nullptr;
+    __gm__ __fp16 * __restrict__ gm_B = nullptr;
+    int64_t lda;
+    int64_t ldb;
+    
+    // 如果需要padding，则gm_A指向新的地址。
+    if (!is_lda_padding) {
+        gm_A = gm_A_nopadding;
+        lda = lda_nopadding;
+    } else {
+        if(transA !=  ASCBLAS_OP_N) {
+            matrix_padding(gm_A_padding, gm_A_nopadding, K, M, K0, M0, lda_nopadding, lda_padding);
+        } else {
+            matrix_padding(gm_A_padding, gm_A_nopadding, M, K, M0, K0, lda_nopadding, lda_padding);
+        }
+        gm_A = gm_A_padding;
+        lda = lda_padding;
+        // matrix_padding 执行结束，告诉AIC可以进行矩阵乘法了。
+        // 这里是所有AIC等待所有AIV，当 matrix_padding 完成才可以进行矩阵乘法
+        ffts_cross_core_sync(PIPE_MTE3, GET_FFST_MSG(0, 1));
+        wait_flag_dev(1);
+        ffts_cross_core_sync(PIPE_MTE3, GET_FFST_MSG(2, 1));
+    }
+
+    // 如果需要padding，则gm_B指向新的地址。
+    if (!is_ldb_padding) {
+        gm_B = gm_B_nopadding;
+        ldb = ldb_nopadding;
+    } else {
+        if(transB !=  ASCBLAS_OP_N) {
+            matrix_padding(gm_B_padding, gm_B_nopadding, N, K, N0, K0, ldb_nopadding, ldb_padding);
+        } else {
+            matrix_padding(gm_B_padding, gm_B_nopadding, K, N, K0, N0, ldb_nopadding, ldb_padding);
+        }
+        gm_B = gm_B_padding;
+        ldb = ldb_padding;
+        // matrix_padding 执行结束，告诉AIC可以进行矩阵乘法了。
+        // 这里是所有AIC等待所有AIV，当 matrix_padding 完成才可以进行矩阵乘法
+        ffts_cross_core_sync(PIPE_MTE3, GET_FFST_MSG(0, 2));
+        wait_flag_dev(2);
+        ffts_cross_core_sync(PIPE_MTE3, GET_FFST_MSG(2, 2));
+    }
+
+    // 执行乘alpha加beta 乘 C
+    if (is_dot_alpha_add_beta_C) {
+        add_beta_dot_C_and_alpha_dot_AB(
+            transA,
+            transB,
+            M,
+            N,
+            K,
+            alpha,
+            gm_A,
+            lda,
+            gm_B,
+            ldb,
+            beta,
+            gm_C,
+            ldc,
+            batchSize,
+            M0,
+            N0,
+            K0,
+            AIV_AIC_workspace
+        );
+    }
+
+    pipe_barrier(PIPE_ALL);
+}
+
+#endif
+

@@ -1,0 +1,5 @@
+{
+    "blockDim": 1,
+    "kernelName": "ascblasHgemm_kernel",
+    "magic:": "RT_DEV_BINARY_MAGIC_ELF"
+}
