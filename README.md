@@ -26,6 +26,11 @@
    cd mindspore
    ./test.sh
    ```
-
    
+若出现DOS风格换行符异常:
+```
+vim script.sh
+:set ff=unix
+:wq
+```
 
