@@ -4,6 +4,8 @@ import mindspore as ms
 import mindspore.ops as ops
 from mindspore import Profiler
 import time
+#pynative_synchronize=True
+ms.set_context(device_target='Ascend', device_id=0)
 
 def hgemv(A,x):
     y=ops.matmul(A,x)
@@ -20,7 +22,7 @@ def profile(func,A,x):
         func(A,x)
         if i == 9:
             profiler.stop()
-
+    
 parser = argparse.ArgumentParser()
 parser.add_argument('--trans', action='store', type=int, default=0)
 parser.add_argument('-M', action='store', type=int, default=1024)
@@ -39,9 +41,17 @@ if args.trans:
     A = ms.Tensor(np.random.uniform(0,1, size=(M, N)).astype(np.float16)).astype(np.float16)
     x = ms.Tensor(np.random.uniform(0,1, size=(1, M)).astype(np.float16)).astype(np.float16)
 
+# profiler
 if args.trans:
     profile(hgevm,A,x)
 else:
     profile(hgemv,A,x)
-
 profiler.analyse()
+# start_time = time.time()
+# for _ in range(1000):
+#     y = ops.matmul(A,x)
+# end_time = time.time()
+
+# duration = (end_time - start_time)*1e-3 #ms
+# gflops = 2 * M * N / (duration * 1e-3) *1e-9
+# print(gflops)

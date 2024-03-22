@@ -18,7 +18,7 @@ with open(filepath, newline='') as csvfile:
     reader = csv.DictReader(csvfile)
     time_ms = 0.0
     for row in reader:
-        time_ms += float(row['total_time'])
+        time_ms += float(row['task_duration'])
     print(time_ms)
 Gflops = 2.0 * M * N * 1e-9
 print("trans: ", trans, "M: ", M, "N: ", N, "Tflops: ", Gflops / time_ms)
